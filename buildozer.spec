@@ -11,6 +11,6 @@ fullscreen = 1
 android.permissions = INTERNET, RECORD_AUDIO, CALL_PHONE, READ_CONTACTS, WRITE_EXTERNAL_STORAGE, READ_EXTERNAL_STORAGE
 android.api = 31
 android.minapi = 24
-android.archs = arm64-v8a, armeabi-v7a
+android.archs = arm64-v8a
 android.allow_backup = True
 android.accept_sdk_license = True
