@@ -6,33 +6,21 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    container:
+      image: kivy/buildozer:latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y git zip unzip openjdk-17-jdk python3-pip autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev cmake libffi-dev libssl-dev
-          pip3 install --user --upgrade buildozer cython
-      - name: First build (SDK download)
-        run: |
-          export PATH=$PATH:~/.local/bin
-          yes | buildozer android debug || true
-        continue-on-error: true
-      - name: Fix sdkmanager path
+      - name: Accept Android Licenses
         run: |
           SDK=$HOME/.buildozer/android/platform/android-sdk
+          mkdir -p $SDK/tools/bin
           if [ -d "$SDK/cmdline-tools/latest/bin" ]; then
-            mkdir -p "$SDK/tools/bin"
-            cp "$SDK/cmdline-tools/latest/bin/"* "$SDK/tools/bin/"
+            cp $SDK/cmdline-tools/latest/bin/* $SDK/tools/bin/
           fi
-          ls "$SDK/tools/bin/" || true
+          yes | $SDK/tools/bin/sdkmanager --licenses || true
       - name: Build APK
         run: |
-          export PATH=$PATH:~/.local/bin
-          yes | buildozer android debug
+          buildozer android debug
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
