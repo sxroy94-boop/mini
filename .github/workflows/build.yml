@@ -11,10 +11,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build APK
-        env:
-          BUILDOZER_ALLOW_ROOT: 1
         run: |
-          buildozer android debug
+          export BUILDOZER_ALLOW_ROOT=1
+          echo "y" | buildozer android debug
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
