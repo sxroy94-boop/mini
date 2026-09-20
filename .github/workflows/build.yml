@@ -10,15 +10,9 @@ jobs:
       image: kivy/buildozer:latest
     steps:
       - uses: actions/checkout@v4
-      - name: Accept Android Licenses
-        run: |
-          SDK=$HOME/.buildozer/android/platform/android-sdk
-          mkdir -p $SDK/tools/bin
-          if [ -d "$SDK/cmdline-tools/latest/bin" ]; then
-            cp $SDK/cmdline-tools/latest/bin/* $SDK/tools/bin/
-          fi
-          yes | $SDK/tools/bin/sdkmanager --licenses || true
       - name: Build APK
+        env:
+          BUILDOZER_ALLOW_ROOT: 1
         run: |
           buildozer android debug
       - name: Upload APK
