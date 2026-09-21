@@ -16,7 +16,7 @@ jobs:
           sudo apt update
           sudo apt install -y git zip unzip openjdk-17-jdk autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev cmake libffi-dev libssl-dev
           pip install --upgrade pip setuptools wheel
-          pip install --upgrade buildozer cython
+          pip install buildozer==1.5.0 cython
       - name: Build with Buildozer
         run: |
           export PATH=$PATH:~/.local/bin
