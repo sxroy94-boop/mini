@@ -1,6 +1,8 @@
-"""mini - Android voice assistant (always listening + proactive mode)."""
+"""mini - JARVIS style Android voice assistant (Kivy + pyjnius). Single file."""
+import collections
 import datetime
 import json
+import math
 import os
 import random
 import re
@@ -14,11 +16,14 @@ import urllib.request
 from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.window import Window
+from kivy.graphics import Color, Ellipse, Line, Point
+from kivy.metrics import dp
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.label import Label
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.textinput import TextInput
+from kivy.uix.widget import Widget
 from kivy.utils import platform
 
 try:
@@ -27,31 +32,26 @@ except Exception:
     certifi = None
 
 ANDROID = platform == "android"
-MODEL = "gemini-1.5-flash"
-SYSTEM = (
-    "You are mini, a friendly AI voice assistant on an Android phone. "
-    "Reply in 1-2 short spoken sentences. No markdown, no lists, no emojis."
-)
-PROACTIVE_SYSTEM = (
-    "You are mini. Boss has been quiet for a while. "
-    "Start a short friendly conversation in 1 sentence. "
-    "Ask something personal, share a small thought, or tell a tiny fun fact. "
-    "Keep it natural. No markdown, no emojis."
-)
-SLEEP_TIMEOUT = 900        # 15 min silence -> sleep mode
-PROACTIVE_TIMEOUT = 300    # 5 min silence (while online) -> mini talks itself
+REQ_SPEECH = 4242
+MODEL = "gemini-3.1-flash-lite"  # change inside the app: type "use model <name>"
+GOLD = (1, 0.76, 0.2, 1)
+MEMORY_DAYS = 35
+IDLE_SLEEP_SECONDS = 15 * 60
+PROACTIVE_SECONDS = 5 * 60
+WAKE = re.compile(r"\b(?:mini|minnie|meeni|mini's)\b")
 
 if ANDROID:
     from android import activity as android_activity
     from android.permissions import Permission, check_permission, request_permissions
+    from android.runnable import run_on_ui_thread
     from jnius import PythonJavaClass, autoclass, cast, java_method
 
     PythonActivity = autoclass("org.kivy.android.PythonActivity")
     Intent = autoclass("android.content.Intent")
     Uri = autoclass("android.net.Uri")
     RecognizerIntent = autoclass("android.speech.RecognizerIntent")
-    TextToSpeech = autoclass("android.speech.tts.TextToSpeech")
     SpeechRecognizer = autoclass("android.speech.SpeechRecognizer")
+    TextToSpeech = autoclass("android.speech.tts.TextToSpeech")
     Locale = autoclass("java.util.Locale")
 
     class TTSInit(PythonJavaClass):
@@ -66,73 +66,657 @@ if ANDROID:
         def onInit(self, status):
             self.callback(status)
 
-    class SpeechListener(PythonJavaClass):
+    class RecListener(PythonJavaClass):
         __javainterfaces__ = ["android/speech/RecognitionListener"]
         __javacontext__ = "app"
 
-        def __init__(self, on_result, on_error):
+        def __init__(self, on_text, on_error):
             super().__init__()
-            self.on_result = on_result
+            self.on_text = on_text
             self.on_error = on_error
 
         @java_method("(Landroid/os/Bundle;)V")
-        def onReadyForSpeech(self, params): pass
+        def onReadyForSpeech(self, params):
+            pass
 
         @java_method("()V")
-        def onBeginningOfSpeech(self): pass
+        def onBeginningOfSpeech(self):
+            pass
 
         @java_method("(F)V")
-        def onRmsChanged(self, rms): pass
+        def onRmsChanged(self, rms):
+            pass
 
         @java_method("([B)V")
-        def onBufferReceived(self, buf): pass
+        def onBufferReceived(self, buf):
+            pass
 
         @java_method("()V")
-        def onEndOfSpeech(self): pass
+        def onEndOfSpeech(self):
+            pass
 
         @java_method("(I)V")
-        def onError(self, error):
-            self.on_error(error)
+        def onError(self, code):
+            self.on_error(code)
 
         @java_method("(Landroid/os/Bundle;)V")
         def onResults(self, results):
-            try:
-                matches = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                if matches is not None and matches.size() > 0:
-                    text = matches.get(0)
-                    text = text if isinstance(text, str) else text.toString()
-                    self.on_result(text)
-                    return
-            except Exception:
-                pass
-            self.on_result("")
+            text = ""
+            lst = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+            if lst is not None and lst.size() > 0:
+                first = lst.get(0)
+                text = first if isinstance(first, str) else first.toString()
+            self.on_text(text)
 
         @java_method("(Landroid/os/Bundle;)V")
-        def onPartialResults(self, partial): pass
+        def onPartialResults(self, partial):
+            pass
 
-        @java_method("(Landroid/os/Bundle;)V")
-        def onEvent(self, eventType, params): pass
+        @java_method("(ILandroid/os/Bundle;)V")
+        def onEvent(self, event, params):
+            pass
+
+else:
+
+    def run_on_ui_thread(f):
+        return f
 
 
-def call_gemini(key, messages, system=SYSTEM):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={key}"
-    contents = []
-    for m in messages:
-        role = "user" if m["role"] == "user" else "model"
-        contents.append({"role": role, "parts": [{"text": m["content"]}]})
-    payload = {
-        "contents": contents,
-        "systemInstruction": {"parts": [{"text": system}]},
-    }
-    body = json.dumps(payload).encode()
-    req = urllib.request.Request(url, data=body, headers={"content-type": "application/json"})
-    ctx = ssl.create_default_context(cafile=certifi.where()) if certifi else ssl.create_default_context()
-    with urllib.request.urlopen(req, timeout=40, context=ctx) as r:
+# ================================================================ replies
+Reply = collections.namedtuple("Reply", "spoken shown")
+DEVA = re.compile(r"[\u0900-\u097F]")
+NUM = re.compile(r"\d[\d:.,]*(?:\s?[AaPp]\.?[Mm]\.?)?")
+
+
+def R(spoken, shown=None):
+    return Reply(spoken, spoken if shown is None else shown)
+
+
+def has_deva(text):
+    return bool(DEVA.search(text))
+
+
+def segments(text, base):
+    """Split text so numbers are always spoken with the English voice."""
+    out, pos = [], 0
+    for m in NUM.finditer(text):
+        if m.start() > pos:
+            out.append((base, text[pos:m.start()]))
+        out.append(("en", m.group()))
+        pos = m.end()
+    if pos < len(text):
+        out.append((base, text[pos:]))
+    return [(lang, s) for lang, s in out if s.strip()]
+
+
+# {n} is replaced by the user's nickname. Each value is (spoken, shown).
+# Hindi is spoken in Devanagari but shown in Roman letters (no font needed).
+RESP = {
+    "hello": {
+        "normal": ("नमस्ते {n}! कैसे हो?", "Namaste {n}! Kaise ho?"),
+        "personal": ("नमस्ते {n}! आप कैसे हो जान?", "Namaste {n}! Aap kaise ho jaan?"),
+        "gf": ("Hello jaan! आपकी बहुत याद आ रही थी।", "Hello jaan! Aapki bahut yaad aa rahi thi."),
+    },
+    "kaise": {
+        "normal": ("मैं ठीक हूँ! आप कैसे हो?", "Main theek hoon! Aap kaise ho?"),
+        "personal": (
+            "मैं ठीक हूँ, आपसे बात करके अच्छा लगा। आप कैसे हो जान?",
+            "Main theek hoon, aapse baat karke accha laga. Aap kaise ho jaan?",
+        ),
+        "gf": (
+            "आपके बिना थोड़ा उदास थी, अब ठीक हूँ। आप कैसे हो जान?",
+            "Aapke bina thoda udaas thi, ab theek hoon. Aap kaise ho jaan?",
+        ),
+    },
+    "howare": {"normal": ("मैं ठीक हूँ", "Main theek hoon")},
+    "thanks": {"normal": ("आपका स्वागत है", "Aapka swagat hai")},
+    "name": {"normal": ("मेरा नाम मिनी है", "Mera naam Mini hai")},
+    "gmorning": {
+        "normal": ("गुड मॉर्निंग {n}! आप कैसे हो?", "Good morning {n}! Aap kaise ho?"),
+        "gf": ("Good morning jaan! आपने अच्छे से सोया?", "Good morning jaan! Aapne accha se soya?"),
+    },
+    "love": {
+        "normal": ("आई लव यू टू {n}!", "I love you too {n}!"),
+        "personal": ("I love you too jaan!", "I love you too jaan!"),
+        "gf": ("I love you too jaan! Muah!", "I love you too jaan! Muah!"),
+    },
+    "sorry": {"normal": ("कोई बात नहीं {n}!", "Koi baat nahin {n}!")},
+    "yes": {"normal": ("ओके {n}!", "Okay {n}!")},
+    "no": {"normal": ("ठीक है {n}.", "Theek hai {n}.")},
+    "ok": {"normal": ("ठीक है {n}!", "Theek hai {n}!")},
+}
+
+PATTERNS = [
+    ("hello", r"hello|hi|hey|hello there|hi there|namaste|namaskar|नमस्ते"),
+    ("kaise", r"(?:aap )?kaise ho|(?:aap )?kaisi ho|kese ho|kaisa hai|आप कैसे हो|कैसे हो"),
+    ("howare", r"how are you|how r u|how are you doing"),
+    ("thanks", r"thank you|thanks|thank u|shukriya|dhanyavad|धन्यवाद|शुक्रिया"),
+    ("name", r"what(?:'s| is) your name|tumhara naam kya hai|aapka naam kya hai|तुम्हारा नाम क्या है|आपका नाम क्या है"),
+    ("gmorning", r"good morning|suprabhat|सुप्रभात"),
+    ("sorry", r"sorry|maaf karo|maaf kijiye|सॉरी"),
+    ("yes", r"yes|haan|han|ha|हाँ|हां"),
+    ("no", r"no|nahi|nahin|nope|नहीं"),
+    ("ok", r"ok|okay|thik hai|theek hai|ठीक है"),
+]
+LOVE = r"i love you|love you|i love u|आई लव यू"
+ASK_AFTER = {"hello", "kaise", "howare", "gmorning", "thanks", "yes", "no", "ok", "sorry"}
+
+GF_QUESTIONS = [
+    R("आप अभी क्या कर रहे हो?", "Aap abhi kya kar rahe ho?"),
+    R("आपने खाना खाया?", "Aapne khana khaya?"),
+    R("आज आपका दिन कैसा रहा?", "Aaj aapka din kaisa raha?"),
+    R("What are you thinking about right now?"),
+]
+PERS_QUESTIONS = [
+    R("आप कैसे हो जान?", "Aap kaise ho jaan?"),
+    R("क्या कर रहे हो?", "Kya kar rahe ho?"),
+    R("आज का दिन कैसा रहा?", "Aaj ka din kaisa raha?"),
+]
+PROACTIVE = {
+    "normal": [
+        R("क्या आपको कुछ चाहिए?", "Kya aapko kuch chahiye?"),
+        R("मैं यहीं हूँ, बताइए।", "Main yahin hoon, bataiye."),
+        R("I am here if you need me."),
+    ],
+    "personal": PERS_QUESTIONS + [R("I miss you.")],
+    "gf": [
+        R("मैं आपको याद कर रही हूँ जान।", "Main aapko yaad kar rahi hoon jaan."),
+        R("I miss you jaan!"),
+        R("आप क्या कर रहे हो?", "Aap kya kar rahe ho?"),
+    ],
+}
+
+APP_ALIASES = {
+    "chrome": ["com.android.chrome"],
+    "youtube": ["com.google.android.youtube"],
+    "whatsapp": ["com.whatsapp"],
+    "facebook": ["com.facebook.katana"],
+    "instagram": ["com.instagram.android"],
+    "telegram": ["org.telegram.messenger"],
+    "chatgpt": ["com.openai.chatgpt"],
+    "google": ["com.google.android.googlequicksearchbox"],
+    "gmail": ["com.google.android.gm"],
+    "maps": ["com.google.android.apps.maps"],
+    "play store": ["com.android.vending"],
+    "spotify": ["com.spotify.music"],
+    "netflix": ["com.netflix.mediaclient"],
+    "vlc": ["org.videolan.vlc"],
+    "phonepe": ["com.phonepe.app"],
+    "paytm": ["net.one97.paytm"],
+    "gpay": ["com.google.android.apps.nbu.paisa.user"],
+    "google pay": ["com.google.android.apps.nbu.paisa.user"],
+    "zomato": ["com.application.zomato"],
+    "swiggy": ["in.swiggy.android"],
+    "flipkart": ["com.flipkart.android"],
+    "amazon": ["in.amazon.mShop.android.shopping", "com.amazon.mShop.android.shopping"],
+}
+
+
+# ================================================================ storage + brain (no Android code)
+class Store:
+    def __init__(self, folder):
+        self.folder = folder
+
+    def path(self, name):
+        return os.path.join(self.folder, name)
+
+    def load(self, name, default):
+        try:
+            with open(self.path(name), encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return default
+
+    def save(self, name, data):
+        with open(self.path(name), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+
+    def read_text(self, name, default=""):
+        try:
+            with open(self.path(name), encoding="utf-8") as f:
+                return f.read().strip() or default
+        except Exception:
+            return default
+
+    def write_text(self, name, value):
+        with open(self.path(name), "w", encoding="utf-8") as f:
+            f.write(value)
+
+
+class Memory:
+    """mini_mem.json - every item has a timestamp, deleted after 35 days."""
+
+    FILE = "mini_mem.json"
+
+    def __init__(self, store, clock=time.time):
+        self.store = store
+        self.clock = clock
+        self.cleanup()
+
+    def cleanup(self):
+        data = self.store.load(self.FILE, {})
+        limit = self.clock() - MEMORY_DAYS * 86400
+        kept = {k: v for k, v in data.items() if v.get("t", 0) >= limit}
+        if len(kept) != len(data):
+            self.store.save(self.FILE, kept)
+        return kept
+
+    def remember(self, key, value):
+        data = self.cleanup()
+        data[key] = {"v": value, "t": self.clock()}
+        self.store.save(self.FILE, data)
+
+    def recall(self, key):
+        item = self.cleanup().get(key)
+        return item["v"] if item else None
+
+    def clear(self):
+        self.store.save(self.FILE, {})
+
+
+class Vault:
+    """mini_pwd.json - kept forever, never auto-deleted."""
+
+    FILE = "mini_pwd.json"
+
+    def __init__(self, store):
+        self.store = store
+
+    def set(self, password):
+        self.store.save(self.FILE, {"password": password})
+
+    def get(self):
+        return self.store.load(self.FILE, {}).get("password")
+
+
+class Brain:
+    """Turns what the user said into an action. Pure Python, easy to test."""
+
+    def __init__(self, store, clock=time.time, now=datetime.datetime.now, rnd=None):
+        self.mem = Memory(store, clock)
+        self.vault = Vault(store)
+        self.now = now
+        self.rnd = rnd or random.Random()
+        self.mood = "normal"
+
+    @property
+    def nick(self):
+        return self.mem.recall("nickname") or "boss"
+
+    def fmt(self, r):
+        n = self.nick
+        return Reply(r.spoken.replace("{n}", n), r.shown.replace("{n}", n))
+
+    def clean(self, raw):
+        s = raw.lower()
+        s = re.sub(r"(?:\b(?:hey|ok|okay)\s+)?\b(?:mini|minnie)\b", " ", s)
+        return re.sub(r"\s+", " ", s).strip(" ,.!?।")
+
+    def greeting(self):
+        h = self.now().hour
+        if 6 <= h < 12:
+            r = R("Good morning {n}!")
+        elif 12 <= h < 17:
+            r = R("Good afternoon! आपका दिन कैसा गया है?", "Good afternoon! Aapka din kaisa gaya hai?")
+        elif 17 <= h < 22:
+            r = R("Good evening! आज का दिन कैसा था?", "Good evening! Aaj ka din kaisa tha?")
+        elif h == 22:
+            r = R("दिन हो गया है। आप डिनर कर लीजिए।", "Din ho gaya hai. Aap dinner kar lijiye.")
+        else:
+            r = R("Good night! Sweet dreams.")
+        return self.fmt(r)
+
+    def proactive(self):
+        return self.fmt(self.rnd.choice(PROACTIVE.get(self.mood, PROACTIVE["normal"])))
+
+    def system_prompt(self):
+        base = (
+            "You are mini, a JARVIS-like voice assistant on an Android phone. "
+            "The user's nickname is %s. Answer in one or two short spoken sentences. "
+            "Reply in the language the user used: English or Hindi. "
+            "For an English reply output exactly: EN@@<text> "
+            "For a Hindi reply output exactly: HI@@<Hindi in Devanagari script>@@<the same sentence in Roman letters> "
+            "Write numbers as digits. No markdown, no emojis. Never use Bengali."
+        ) % self.nick
+        if self.mood == "personal":
+            base += " Use a soft, caring, warm tone and sometimes ask how the user is."
+        elif self.mood == "gf":
+            base += (
+                " Speak like an affectionate, playful girlfriend using words like jaan, "
+                "in Hindi or English only. Keep it sweet and never explicit. "
+                "Sometimes ask a friendly question back."
+            )
+        return base
+
+    def parse_ai(self, text):
+        t = text.strip()
+        if t.startswith("HI@@"):
+            parts = t[4:].split("@@")
+            spoken = parts[0].strip()
+            shown = parts[1].strip() if len(parts) > 1 else spoken
+            if has_deva(shown):
+                shown = "(Hindi voice reply)"
+            return R(spoken, shown)
+        if t.startswith("EN@@"):
+            t = t[4:].strip()
+        return R(t, "(Hindi voice reply)" if has_deva(t) else t)
+
+    def _mood_reply(self, key):
+        table = RESP[key]
+        sp, sh = table.get(self.mood) or table["normal"]
+        r = self.fmt(R(sp, sh))
+        if key in ASK_AFTER and self.mood in ("gf", "personal") and not r.shown.rstrip().endswith("?"):
+            if self.mood == "gf" or self.rnd.random() < 0.5:
+                q = self.rnd.choice(GF_QUESTIONS if self.mood == "gf" else PERS_QUESTIONS)
+                r = Reply(r.spoken + " " + q.spoken, r.shown + " " + q.shown)
+        return r
+
+    def route(self, raw):
+        """Return (kind, payload). Kinds: say, stop, off, vault_save, vault_get,
+        online, model, cc, call, open, search, whatsapp, weather, ai, empty."""
+        raw = raw.strip()
+        if not raw:
+            return ("empty", None)
+        full = re.sub(r"\s+", " ", raw.lower()).strip(" ,.!?।")
+        low = self.clean(raw)
+
+        if re.fullmatch(
+            r"(?:(?:hey|ok|okay) )?mini (?:off|band karo|shutdown|switch off)|(?:shut ?down|power off) mini", full
+        ):
+            return ("off", self.fmt(R("Switching off. Goodbye {n}!", "Switching off. Alvida {n}!")))
+
+        # password vault (checked first so it never reaches the AI)
+        m = re.match(r"^(?:save )?my password is (.+)$", raw, re.I) or re.match(
+            r"^(?:save )?mera password (?!kya\b)(.+?)(?: hai)?$", raw, re.I
+        )
+        if m:
+            self.vault.set(m.group(1).strip(" ."))
+            return ("vault_save", R("Password saved.", "Password saved."))
+        if re.fullmatch(
+            r"what(?:'s| is) my password|tell me my password|mera password kya hai|मेरा पासवर्ड क्या है", low
+        ):
+            pw = self.vault.get()
+            if not pw:
+                return ("vault_get", R("You have not saved a password yet."))
+            spelled = " ".join(pw)
+            return ("vault_get", R("Your password is " + spelled, "Your password is ******** (spoken only)"))
+
+        if not low:
+            return ("say", self.fmt(R("जी {n}?", "Ji {n}?")))
+
+        # stop commands
+        if re.fullmatch(r"bye|good ?bye|stop|band|band karo|band kar do|by|bey|बंद|अलविदा|alvida", low):
+            return ("stop", self.fmt(R("अलविदा {n}!", "Alvida {n}!")))
+        if re.fullmatch(r"good ?night|gud night|shubh ratri|शुभ रात्रि", low):
+            if self.mood == "normal":
+                return ("stop", self.fmt(R("Good night {n}!")))
+            return ("stop", self.fmt(R("Good night jaan! Sweet dreams.")))
+
+        # online / offline
+        m = re.fullmatch(r"(?:(?:go|switch|turn|set)(?: to)? )?(online|offline)(?: mode)?", low)
+        if m:
+            return ("online", m.group(1) == "online")
+
+        # moods
+        if re.fullmatch(
+            r"(?:girlfriend|gf|personal) (?:mode|mood) off|normal (?:mode|mood)|normal ho ja(?:o)?", low
+        ):
+            self.mood = "normal"
+            return ("say", R("Normal mode on."))
+        if re.fullmatch(r"(?:girlfriend|gf) (?:mode|mood)(?: on| chalu)?", low):
+            self.mood = "gf"
+            return ("say", R("Girlfriend mode on. Hi jaan!"))
+        if re.fullmatch(r"personal (?:mode|mood)(?: on)?|पर्सनल मोड", low):
+            self.mood = "personal"
+            return ("say", R("ठीक है, पर्सनल मोड चालू। आप कैसे हो जान?", "Theek hai, personal mode on. Aap kaise ho jaan?"))
+
+        # settings
+        m = re.match(r"^(?:use|set) model\s+(\S+)$", raw.strip(" .!?"), re.I)
+        if m:
+            return ("model", m.group(1))
+        m = re.fullmatch(r"(?:set )?country code \+?(\d{1,3})", low)
+        if m:
+            return ("cc", m.group(1))
+
+        # memory
+        if re.fullmatch(r"what(?:'s| is) my name|mera naam kya hai|who am i|मेरा नाम क्या है", low):
+            name = self.mem.recall("name")
+            if name:
+                return ("say", R("आपका नाम %s है।" % name, "Aapka naam %s hai." % name))
+            return ("say", R("I do not know your name yet. Say: my name is, and your name."))
+        if re.fullmatch(r"forget everything|forget all|sab kuch bhool jao|sab bhool jao|सब भूल जाओ", low):
+            self.mem.clear()
+            return ("say", R("Done. I have forgotten everything."))
+        m = re.match(r"^call me (.+)$", raw, re.I) or re.match(r"^mujhe (.+) bula(?:o|na)$", raw, re.I)
+        if m:
+            nick = m.group(1).strip(" .!?")
+            self.mem.remember("nickname", nick)
+            return ("say", R("Okay, I will call you %s." % nick))
+        m = re.match(r"^my name is (.+)$", raw, re.I) or re.match(
+            r"^mera naam (?!kya\b)(.+?)(?: hai)?$", raw, re.I
+        )
+        if m:
+            name = m.group(1).strip(" .!?")
+            self.mem.remember("name", name)
+            return ("say", R("Nice to meet you, %s." % name))
+
+        # fixed replies
+        if re.search(LOVE, low):
+            return ("say", self._mood_reply("love"))
+        if re.fullmatch(r"good (?:afternoon|evening)", low):
+            return ("say", self.greeting())
+        for key, rx in PATTERNS:
+            if re.fullmatch(rx, low):
+                return ("say", self._mood_reply(key))
+
+        # phone commands
+        m = re.match(r"^whatsapp\s+(?:me\s+|mein\s+)?(.+)$", low)
+        if m:
+            name = re.sub(
+                r"\s+(?:ko\s+)?(?:call|kall|message|msg|chat|text)(?:\s+\w+)?$", "", m.group(1)
+            ).strip()
+            return ("whatsapp", name)
+        m = re.match(r"^(?:call|phone|dial)\s+(.+)$", low) or re.match(
+            r"^(.+?)\s+ko\s+(?:call|phone)(?:\s+(?:karo|kro|kar do))?$", low
+        )
+        if m:
+            return ("call", m.group(1).strip())
+        m = re.match(r"^(?:open|launch|start)\s+(.+)$", low) or re.match(
+            r"^(.+?)\s+(?:kholo|khol do|chalu karo)$", low
+        )
+        if m:
+            return ("open", re.sub(r"\s+app$", "", m.group(1).strip()))
+        m = re.match(r"^(?:search|google)(?: for)?\s+(.+)$", low)
+        if m:
+            return ("search", m.group(1).strip())
+
+        # time, date, weather
+        if re.search(
+            r"what(?:'s| is)? the time|what time is it|current time|tell me the time|^time$", low
+        ):
+            return ("say", self.time_reply("en"))
+        if re.search(r"time kya hai|samay kya hai|टाइम क्या है|समय क्या है|kitne baje", low):
+            return ("say", self.time_reply("hi"))
+        if re.search(
+            r"what(?:'s| is)? (?:the )?date|today'?s date|what day is it|which day is it", low
+        ):
+            return ("say", self.date_reply("en"))
+        if re.search(r"aaj ki (?:date|tareekh|tarikh)|date kya hai|आज की (?:तारीख|डेट)", low):
+            return ("say", self.date_reply("hi"))
+        if re.search(r"weather|mausam|मौसम", low):
+            lang = "hi" if re.search(r"mausam|kaisa|kya|मौसम|कैसा", low) else "en"
+            city = ""
+            m = re.search(r"weather (?:in|of|at|for) (.+)$", low)
+            if m:
+                city = m.group(1).strip()
+            return ("weather", (lang, city))
+
+        return ("ai", raw)
+
+    def time_reply(self, lang):
+        t = self.now().strftime("%I:%M %p").lstrip("0")
+        if lang == "hi":
+            return R("अभी समय %s है।" % t, "Abhi samay %s hai." % t)
+        return R("The time is %s." % t)
+
+    def date_reply(self, lang):
+        d = self.now()
+        text = "%d %s %d" % (d.day, d.strftime("%B"), d.year)
+        if lang == "hi":
+            return R("आज की तारीख %s है।" % text, "Aaj ki tareekh %s hai." % text)
+        return R("Today is %s, %s." % (d.strftime("%A"), text))
+
+    def weather_reply(self, lang, temp, unit, cond):
+        unit_en = "Celsius" if unit == "C" else "Fahrenheit"
+        t = int(temp)
+        spoken_t = ("minus %d" % abs(t)) if t < 0 else str(t)
+        cond = cond.strip().lower()
+        if lang == "hi":
+            unit_hi = "सेल्सियस" if unit == "C" else "फ़ारेनहाइट"
+            return R(
+                "अभी तापमान %s डिग्री %s है और मौसम %s है।" % (spoken_t, unit_hi, cond),
+                "Abhi taapmaan %s degree %s hai aur mausam %s hai." % (spoken_t, unit_en, cond),
+            )
+        return R("It is %s degrees %s and %s." % (spoken_t, unit_en, cond))
+
+
+# ================================================================ Orb (UI)
+STATE_SPEED = {"idle": 18, "listening": 45, "thinking": 130, "speaking": 60, "sleep": 6}
+STATE_AMP = {"idle": 0.02, "listening": 0.05, "thinking": 0.03, "speaking": 0.05, "sleep": 0.01}
+
+
+class Orb(Widget):
+    """Golden particle sphere that always spins anticlockwise."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.state = "idle"
+        self.tap_cb = None
+        self.t = 0.0
+        self.ang = 0.0
+        self.spin = 0.0
+        self.amp = 0.02
+
+        rnd = random.Random(7)
+        pts = []
+        n = 300
+        for i in range(n):
+            y = 1 - 2 * (i + 0.5) / n
+            r = math.sqrt(1 - y * y)
+            th = i * 2.399963
+            k = 0.7 + 0.3 * rnd.random()
+            pts.append((math.cos(th) * r * k, y * k, math.sin(th) * r * k))
+        for tilt, off in ((0.5, 0.0), (1.2, 1.0), (2.0, 2.1)):
+            ct, st = math.cos(tilt), math.sin(tilt)
+            co, so = math.cos(off), math.sin(off)
+            for j in range(90):
+                a = j * 2 * math.pi / 90
+                x, y, z = math.cos(a), math.sin(a) * ct, math.sin(a) * st
+                pts.append((x * co - y * so, x * so + y * co, z))
+        self.pts = pts
+
+        with self.canvas:
+            self.c_g2 = Color(0.9, 0.5, 0.05, 0.10)
+            self.glow2 = Ellipse()
+            self.c_g1 = Color(1, 0.65, 0.1, 0.16)
+            self.glow1 = Ellipse()
+            Color(1, 0.65, 0.15, 0.40)
+            self.p_back = Point(pointsize=dp(1.3))
+            Color(1, 0.85, 0.4, 0.95)
+            self.p_front = Point(pointsize=dp(2.2))
+            Color(1, 0.75, 0.2, 0.55)
+            self.ring = Line(circle=(0, 0, 1), width=dp(1))
+            Color(1, 0.93, 0.65, 0.9)
+            self.core = Ellipse()
+        Clock.schedule_interval(self.tick, 1 / 30.0)
+
+    def on_touch_down(self, touch):
+        if self.collide_point(*touch.pos) and self.tap_cb:
+            self.tap_cb()
+            return True
+        return super().on_touch_down(touch)
+
+    def tick(self, dt):
+        st = self.state
+        self.t += dt
+        self.ang += STATE_SPEED[st] * dt  # positive angle = anticlockwise on screen
+        self.spin += 0.5 * dt
+
+        target = STATE_AMP[st]
+        if st == "speaking":
+            target = 0.04 + 0.10 * abs(math.sin(self.t * 8) * math.sin(self.t * 2.7))
+        self.amp += (target - self.amp) * min(1.0, dt * 8)
+        pulse = 1.0 if st == "speaking" else math.sin(self.t * 2.5)
+        scale = 1 + self.amp * pulse
+
+        cx, cy = self.center_x, self.center_y
+        R_ = min(self.width, self.height) * 0.40 * scale
+
+        th = math.radians(self.ang)
+        ct, sn = math.cos(th), math.sin(th)
+        cp, sp = math.cos(self.spin), math.sin(self.spin)
+        back, front = [], []
+        for x, y, z in self.pts:
+            x1 = x * cp + z * sp
+            z1 = z * cp - x * sp
+            px = cx + R_ * (x1 * ct - y * sn)
+            py = cy + R_ * (x1 * sn + y * ct)
+            if z1 > 0:
+                front.extend((px, py))
+            else:
+                back.extend((px, py))
+        self.p_back.points = back
+        self.p_front.points = front
+
+        g1, g2 = R_ * 1.25, R_ * 1.6
+        self.glow1.pos = (cx - g1, cy - g1)
+        self.glow1.size = (2 * g1, 2 * g1)
+        self.glow2.pos = (cx - g2, cy - g2)
+        self.glow2.size = (2 * g2, 2 * g2)
+        boost = 1.8 if st in ("speaking", "listening") else (0.5 if st == "sleep" else 1.0)
+        self.c_g1.a = min(0.4, 0.16 * boost)
+        self.c_g2.a = min(0.25, 0.10 * boost)
+        self.ring.circle = (cx, cy, R_ * 1.12)
+        rc = R_ * 0.09 * (1 + 2 * self.amp)
+        self.core.pos = (cx - rc, cy - rc)
+        self.core.size = (2 * rc, 2 * rc)
+
+
+# ================================================================ helpers
+def call_gemini(key, model, system, contents):
+    url = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent" % model
+    body = json.dumps(
+        {
+            "system_instruction": {"parts": [{"text": system}]},
+            "contents": contents,
+            "generationConfig": {"maxOutputTokens": 1024},
+        }
+    ).encode()
+    req = urllib.request.Request(
+        url, data=body, headers={"content-type": "application/json", "x-goog-api-key": key}
+    )
+    with urllib.request.urlopen(req, timeout=40, context=ssl_context()) as r:
         out = json.loads(r.read().decode())
-    try:
-        return out["candidates"][0]["content"]["parts"][0]["text"].strip()
-    except Exception:
-        return "Sorry, I could not get an answer."
+    cands = out.get("candidates") or [{}]
+    parts = (cands[0].get("content") or {}).get("parts") or []
+    return "".join(p.get("text", "") for p in parts).strip()
+
+
+def ssl_context():
+    if certifi:
+        return ssl.create_default_context(cafile=certifi.where())
+    return ssl.create_default_context()
+
+
+def fetch_weather(city):
+    url = "https://wttr.in/%s?format=%%t+%%C" % urllib.parse.quote(city)
+    req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
+    with urllib.request.urlopen(req, timeout=15, context=ssl_context()) as r:
+        txt = r.read().decode("utf-8", "ignore").strip()
+    m = re.match(r"([+-]?\d+)\s*\S?\s*([CF])\s*(.*)", txt)
+    if not m:
+        raise ValueError("no weather data")
+    return m.group(1).lstrip("+"), m.group(2), m.group(3) or "clear"
 
 
 def find_number(name):
@@ -153,303 +737,309 @@ def find_number(name):
     return found
 
 
+def styled_button(text, **kw):
+    return Button(
+        text=text, background_normal="", background_color=(0.22, 0.15, 0.02, 1), color=GOLD, **kw
+    )
+
+
+def styled_input(hint, **kw):
+    return TextInput(
+        hint_text=hint,
+        multiline=False,
+        background_color=(0.06, 0.06, 0.09, 1),
+        foreground_color=GOLD,
+        hint_text_color=(0.55, 0.45, 0.2, 1),
+        cursor_color=GOLD,
+        **kw
+    )
+
+
+# ================================================================ App
 class Mini(App):
     title = "mini"
 
     def build(self):
         Window.softinput_mode = "below_target"
+        Window.clearcolor = (0.01, 0.015, 0.03, 1)
+        self.store = Store(self.user_data_dir)
+        self.brain = Brain(self.store)
+        cfg = self.store.load("mini_set.json", {})
+        self.online = bool(cfg.get("online", False))
+        self.proactive_on = bool(cfg.get("proactive", False))
+        self.cc = cfg.get("cc", "91")
+        self.brain.mood = cfg.get("mood", "normal")
+        self.model = cfg.get("model", MODEL)
+        if self.model.startswith(("gemini-1.5", "gemini-2.0")):
+            self.model = MODEL
+
         self.history = []
+        self.lines = []
         self.tts = None
         self.tts_ready = False
+        self.hi_ok = False
         self.pending = None
-        self.mode = "offline"
-        self.always_listen = False
-        self.is_sleeping = True
-        self.last_active = time.time()
-        self.last_proactive = time.time()
-        self.speech = None
-        self.speech_listener = None
-        self.recognition_running = False
-        self.suppress_restart = False
-        self.hard_off = False
+        self.sr = None
+        self.rec_listener = None
+        self.always = False
+        self.asleep = False
+        self.sr_fail = 0
+        now = time.time()
+        self.last_user = now
+        self.last_any = now
+        self.last_clean = now
+        self.conv_until = 0
 
-        root = BoxLayout(orientation="vertical", padding=10, spacing=6)
-
-        # Mode toggle
-        self.mode_btn = Button(
-            text="MODE: OFFLINE",
-            size_hint_y=None, height=50, font_size="15sp",
-            background_color=(0.2, 0.6, 0.2, 1),
+        root = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8))
+        root.add_widget(
+            Label(text="M  I  N  I", color=GOLD, font_size="20sp", size_hint_y=None, height=dp(34))
         )
-        self.mode_btn.bind(on_release=self.toggle_mode)
-        root.add_widget(self.mode_btn)
+        self.orb = Orb(size_hint_y=0.45)
+        self.orb.tap_cb = self.listen
+        root.add_widget(self.orb)
 
-        # Always listen toggle
-        self.listen_btn = Button(
-            text="ALWAYS LISTEN: OFF",
-            size_hint_y=None, height=50, font_size="15sp",
-            background_color=(0.5, 0.2, 0.2, 1),
-        )
-        self.listen_btn.bind(on_release=self.toggle_always_listen)
-        root.add_widget(self.listen_btn)
-
-        # Proactive toggle
-        self.proactive_btn = Button(
-            text="PROACTIVE: OFF",
-            size_hint_y=None, height=50, font_size="15sp",
-            background_color=(0.3, 0.3, 0.5, 1),
-        )
-        self.proactive_btn.bind(on_release=self.toggle_proactive)
-        self.proactive_on = False
-        root.add_widget(self.proactive_btn)
-
-        self.scroll = ScrollView()
-        self.log = Label(size_hint_y=None, halign="left", valign="top", font_size="14sp")
+        self.scroll = ScrollView(size_hint_y=0.22)
+        self.log = Label(size_hint_y=None, halign="center", valign="top", font_size="15sp", color=GOLD)
         self.log.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
         self.log.bind(texture_size=lambda w, s: setattr(w, "height", s[1]))
         self.scroll.add_widget(self.log)
         root.add_widget(self.scroll)
 
-        row = BoxLayout(size_hint_y=None, height=42, spacing=6)
-        self.inp = TextInput(hint_text="Type a command", multiline=False)
+        row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(6))
+        self.inp = styled_input("Type a command")
         self.inp.bind(on_text_validate=self.on_send)
         row.add_widget(self.inp)
-        row.add_widget(Button(text="Send", size_hint_x=None, width=80, on_release=self.on_send))
+        row.add_widget(styled_button("Send", size_hint_x=None, width=dp(80), on_release=self.on_send))
         root.add_widget(row)
 
         root.add_widget(
-            Button(text="SPEAK NOW", size_hint_y=None, height=60, font_size="18sp", on_release=self.manual_speak)
+            styled_button("SPEAK", size_hint_y=None, height=dp(60), font_size="22sp", on_release=self.listen)
         )
 
-        keyrow = BoxLayout(size_hint_y=None, height=42, spacing=6)
-        self.key_inp = TextInput(hint_text="Gemini API key", password=True, multiline=False)
+        row3 = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        self.mode_btn = styled_button("", font_size="13sp", on_release=self.toggle_mode)
+        self.listen_btn = styled_button("", font_size="13sp", on_release=self.toggle_listen)
+        self.pro_btn = styled_button("", font_size="13sp", on_release=self.toggle_pro)
+        for b in (self.mode_btn, self.listen_btn, self.pro_btn):
+            row3.add_widget(b)
+        root.add_widget(row3)
+
+        keyrow = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(6))
+        self.key_inp = styled_input("Google Gemini API key", password=True)
         keyrow.add_widget(self.key_inp)
-        keyrow.add_widget(Button(text="Save key", size_hint_x=None, width=100, on_release=self.save_key))
+        keyrow.add_widget(
+            styled_button("Save key", size_hint_x=None, width=dp(100), on_release=self.save_key)
+        )
         root.add_widget(keyrow)
+
+        self.refresh_buttons()
         return root
-
-    # ---------- mode toggle ----------
-    def toggle_mode(self, *_):
-        if self.mode == "offline":
-            if not self.load_key():
-                self.add("(Online mode needs Gemini API key. Save key first.)")
-                return
-            self.mode = "online"
-            self.mode_btn.text = "MODE: ONLINE"
-            self.mode_btn.background_color = (0.2, 0.4, 0.8, 1)
-            self.last_proactive = time.time()
-            self.say("Online mode on.")
-        else:
-            self.mode = "offline"
-            self.mode_btn.text = "MODE: OFFLINE"
-            self.mode_btn.background_color = (0.2, 0.6, 0.2, 1)
-            self.say("Offline mode on.")
-
-    # ---------- always listen toggle ----------
-    def toggle_always_listen(self, *_):
-        if not ANDROID:
-            self.add("Always listen works only on Android.")
-            return
-        if not self.always_listen:
-            self.always_listen = True
-            self.is_sleeping = True
-            self.listen_btn.text = "ALWAYS LISTEN: ON"
-            self.listen_btn.background_color = (0.2, 0.7, 0.2, 1)
-            self.add("(Always listen ON. Say 'mini' to wake.)")
-            self.speak("Always listening on. Say mini to wake me.")
-            self.start_speech_loop()
-        else:
-            self.always_listen = False
-            self.listen_btn.text = "ALWAYS LISTEN: OFF"
-            self.listen_btn.background_color = (0.5, 0.2, 0.2, 1)
-            self.stop_speech_loop()
-            self.add("(Always listen OFF)")
-
-    # ---------- proactive toggle ----------
-    def toggle_proactive(self, *_):
-        if not self.proactive_on:
-            if self.mode != "online":
-                self.add("(Proactive needs Online mode.)")
-                return
-            self.proactive_on = True
-            self.proactive_btn.text = "PROACTIVE: ON"
-            self.proactive_btn.background_color = (0.2, 0.7, 0.4, 1)
-            self.last_proactive = time.time()
-            self.say("Proactive mode on. I will talk to you sometimes.")
-        else:
-            self.proactive_on = False
-            self.proactive_btn.text = "PROACTIVE: OFF"
-            self.proactive_btn.background_color = (0.3, 0.3, 0.5, 1)
-            self.say("Proactive mode off.")
 
     # ---------- lifecycle ----------
     def on_start(self):
         if ANDROID:
             android_activity.bind(on_activity_result=self.on_activity_result)
-            request_permissions([
-                Permission.RECORD_AUDIO,
-                Permission.READ_CONTACTS,
-                Permission.CALL_PHONE,
-            ])
+            request_permissions(
+                [Permission.RECORD_AUDIO, Permission.READ_CONTACTS, Permission.CALL_PHONE]
+            )
             self.init_tts()
-            Clock.schedule_interval(self.tick, 20)
-        self.say("Hello Boss! I am mini. Offline mode. Tap ALWAYS LISTEN to enable wake word.")
+            self.rec_listener = RecListener(self.sr_text_cb, self.sr_err_cb)
+        self.say(self.brain.greeting())
+        Clock.schedule_interval(self.housekeeping, 15)
 
     def on_pause(self):
         return True
 
     def on_stop(self):
-        self.stop_speech_loop()
+        self.ui_sr_destroy()
         if self.tts is not None:
             try:
                 self.tts.shutdown()
             except Exception:
                 pass
 
-    # ---------- tick: sleep + proactive ----------
-    def tick(self, dt):
-        now = time.time()
-        # Sleep mode check
-        if self.always_listen and not self.is_sleeping:
-            if now - self.last_active > SLEEP_TIMEOUT:
-                self.is_sleeping = True
-                self.add("(sleeping - say 'mini')")
-                self.speak("Going to sleep.")
-        # Proactive check
-        if (self.proactive_on and self.mode == "online"
-                and not self.is_sleeping
-                and now - self.last_proactive > PROACTIVE_TIMEOUT
-                and now - self.last_active > PROACTIVE_TIMEOUT):
-            self.last_proactive = now
-            self.speak_proactive()
+    # ---------- settings ----------
+    def save_settings(self):
+        self.store.save(
+            "mini_set.json",
+            {
+                "online": self.online,
+                "proactive": self.proactive_on,
+                "mood": self.brain.mood,
+                "model": self.model,
+                "cc": self.cc,
+            },
+        )
 
-    def speak_proactive(self):
-        key = self.load_key()
+    def refresh_buttons(self):
+        self.mode_btn.text = "ONLINE" if self.online else "OFFLINE"
+        self.listen_btn.text = "LISTEN: " + ("ON" if self.always else "OFF")
+        self.pro_btn.text = "PROACTIVE: " + ("ON" if self.proactive_on else "OFF")
+
+    def set_mode(self, online):
+        self.online = online
+        self.save_settings()
+        self.refresh_buttons()
+        if online:
+            self.say("Online mode. I will use Gemini for chat and weather.")
+        else:
+            self.say("Offline mode. Phone commands only.")
+
+    def toggle_mode(self, *_):
+        self.wake()
+        self.set_mode(not self.online)
+
+    def toggle_pro(self, *_):
+        self.wake()
+        self.proactive_on = not self.proactive_on
+        self.last_any = time.time()
+        self.save_settings()
+        self.refresh_buttons()
+        self.say("Proactive on. I will talk if it is quiet for 5 minutes." if self.proactive_on else "Proactive off.")
+
+    def save_key(self, *_):
+        key = self.key_inp.text.strip()
         if not key:
             return
-        prompts = [
-            "Start a short friendly sentence to Boss.",
-            "Ask Boss how his day is going.",
-            "Share a tiny interesting fact.",
-            "Say something warm and personal.",
-            "Ask Boss what he is doing right now.",
-        ]
-        msg = [{"role": "user", "content": random.choice(prompts)}]
-        self.add("(mini is thinking of something to say...)")
+        self.store.write_text("gemini_key.txt", key)
+        self.key_inp.text = ""
+        self.add("(API key saved on this phone)")
 
-        def worker():
-            try:
-                reply = call_gemini(key, msg, system=PROACTIVE_SYSTEM)
-                Clock.schedule_once(lambda dt, r=reply: self.on_proactive_reply(r))
-            except Exception:
-                pass
+    # ---------- ui helpers ----------
+    def add(self, line):
+        self.lines = (self.lines + [line])[-4:]
+        self.log.text = "\n\n".join(self.lines)
+        Clock.schedule_once(lambda dt: setattr(self.scroll, "scroll_y", 0), 0.1)
 
-        threading.Thread(target=worker, daemon=True).start()
+    def set_state(self, state, hold=None):
+        Clock.unschedule(self._idle)
+        self.orb.state = state
+        if hold:
+            Clock.schedule_once(self._idle, hold)
 
-    def on_proactive_reply(self, reply):
-        if reply:
-            self.say(reply)
+    def _idle(self, dt=None):
+        self.orb.state = "sleep" if self.asleep else "idle"
 
-    # ---------- speech loop ----------
-    def start_speech_loop(self):
-        if not ANDROID:
-            return
+    def say(self, r):
+        if isinstance(r, str):
+            r = R(r)
+        now = time.time()
+        self.last_any = now
+        self.add("mini: " + r.shown)
+        hold = 0.8 + len(r.shown) * 0.06
+        self.conv_until = now + hold + 20
+        self.set_state("speaking", hold)
+        self.speak(r)
+
+    def on_send(self, *_):
+        text = self.inp.text
+        self.inp.text = ""
+        self.handle(text)
+
+    def is_speaking(self):
+        if self.orb.state in ("speaking", "thinking"):
+            return True
         try:
-            if self.speech is None:
-                self.speech = SpeechRecognizer.createSpeechRecognizer(PythonActivity.mActivity)
-                self.speech_listener = SpeechListener(self.on_speech_result, self.on_speech_error)
-                self.speech.setRecognitionListener(self.speech_listener)
-            self.schedule_restart(0.3)
-        except Exception as e:
-            self.add("Speech init error: %s" % e)
-
-    def stop_speech_loop(self):
-        self.suppress_restart = True
-        try:
-            if self.speech is not None:
-                self.speech.stopListening()
-                self.speech.cancel()
+            return bool(self.tts is not None and self.tts.isSpeaking())
         except Exception:
-            pass
-        self.recognition_running = False
+            return False
 
-    def schedule_restart(self, delay=0.5):
-        if not self.always_listen or self.suppress_restart or self.hard_off:
-            return
-        Clock.schedule_once(lambda dt: self.begin_listening(), delay)
+    # ---------- sleep / wake ----------
+    def wake(self):
+        self.last_user = time.time()
+        if self.asleep:
+            self.asleep = False
+            self.set_state("idle")
 
-    def begin_listening(self):
-        if not self.always_listen or self.suppress_restart or self.hard_off:
+    def sleep_now(self, msg):
+        self.stop_always()
+        self.asleep = True
+        self.set_state("sleep")
+        if msg:
+            self.say(msg)
+
+    def housekeeping(self, dt):
+        now = time.time()
+        if now - self.last_clean > 3600:
+            self.last_clean = now
+            self.brain.mem.cleanup()
+        if self.asleep:
             return
+        if self.always and now - self.last_user > IDLE_SLEEP_SECONDS:
+            return self.sleep_now("I am going to sleep. Tap the orb to wake me.")
+        if self.proactive_on and now - self.last_any > PROACTIVE_SECONDS and not self.is_speaking():
+            self.say(self.brain.proactive())
+
+    # ---------- voice output ----------
+    def init_tts(self):
+        def on_init(status):
+            if status == TextToSpeech.SUCCESS:
+                try:
+                    self.hi_ok = self.tts.setLanguage(Locale("hi", "IN")) >= 0
+                    self.tts.setLanguage(Locale.US)
+                except Exception:
+                    self.hi_ok = False
+                self.tts_ready = True
+                if self.pending:
+                    self.speak_now(self.pending)
+                    self.pending = None
+            else:
+                Clock.schedule_once(lambda dt: self.add("(voice output not available)"))
+
+        self.tts_listener = TTSInit(on_init)
+        self.tts = TextToSpeech(PythonActivity.mActivity, self.tts_listener)
+
+    def speak(self, r):
+        if not ANDROID or self.tts is None:
+            return
+        if self.tts_ready:
+            self.speak_now(r)
+        else:
+            self.pending = r
+
+    def speak_now(self, r):
         try:
-            i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
-            i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, True)
-            i.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
-            self.speech.startListening(i)
-            self.recognition_running = True
+            deva = has_deva(r.spoken)
+            if deva and not self.hi_ok:
+                text, base = r.shown, "en"  # no Hindi voice installed: read Roman text
+            else:
+                text, base = r.spoken, ("hi" if deva else "en")
+            text = re.sub(r"[*_#`]", "", text)
+            first = True
+            for lang, chunk in segments(text, base):
+                self.tts.setLanguage(Locale("hi", "IN") if lang == "hi" else Locale.US)
+                self.tts.speak(chunk, TextToSpeech.QUEUE_FLUSH if first else TextToSpeech.QUEUE_ADD, None)
+                first = False
         except Exception as e:
-            self.add("Listen error: %s" % e)
-            self.schedule_restart(2)
+            msg = str(e)
+            Clock.schedule_once(lambda dt: self.add("(voice error: %s)" % msg))
 
-    def on_speech_error(self, error):
-        self.recognition_running = False
-        self.schedule_restart(0.4)
-
-    def on_speech_result(self, text):
-        self.recognition_running = False
-        if not text:
-            self.schedule_restart(0.4)
-            return
-
-        t = text.strip()
-        low = t.lower()
-
-        # Hard off check
-        if "mini off" in low or "mic off" in low or "mini band" in low:
-            self.hard_off = True
-            self.always_listen = False
-            self.stop_speech_loop()
-            self.speak("Mic off. Goodbye boss.")
-            self.add("(Hard off - tap ALWAYS LISTEN to restart)")
-            return
-
-        # Sleep mode: wait for wake word
-        if self.is_sleeping:
-            if "mini" in low or "hey mini" in low:
-                self.is_sleeping = False
-                self.last_active = time.time()
-                self.last_proactive = time.time()
-                self.speak("Yes boss?")
-                self.add("mini: (awake) Yes boss?")
-            self.schedule_restart(0.4)
-            return
-
-        self.last_active = time.time()
-        self.last_proactive = time.time()
-        low = low.replace("hey mini", "").replace("mini", "").strip(" ,.!?")
-        if not low:
-            self.schedule_restart(0.4)
-            return
-
-        Clock.schedule_once(lambda dt: self.handle(low))
-        self.schedule_restart(1.2)
-
-    # ---------- manual speak ----------
-    def manual_speak(self, *_):
+    # ---------- voice input: SPEAK button (Google dialog) ----------
+    def listen(self, *_):
+        self.wake()
         if not ANDROID:
             self.add("Mic works only on Android.")
             return
         try:
+            if self.always:
+                Clock.unschedule(self.start_loop)
+                self.ui_sr_stop()
+            self.set_state("listening", 45)
             i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
             i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             i.putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak to mini")
-            PythonActivity.mActivity.startActivityForResult(i, 4242)
+            PythonActivity.mActivity.startActivityForResult(i, REQ_SPEECH)
         except Exception as e:
+            self.set_state("idle")
             self.add("Voice error: %s" % e)
 
     def on_activity_result(self, request_code, result_code, intent):
-        if request_code != 4242 or result_code != -1 or intent is None:
+        if request_code != REQ_SPEECH:
+            return
+        Clock.schedule_once(lambda dt: self.set_state("idle"))
+        if self.always:
+            Clock.schedule_once(lambda dt: self.loop_later(1.5))
+        if result_code != -1 or intent is None:
             return
         lst = intent.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
         if lst is None or lst.size() == 0:
@@ -458,143 +1048,199 @@ class Mini(App):
         text = first if isinstance(first, str) else first.toString()
         Clock.schedule_once(lambda dt: self.handle(text))
 
-    # ---------- ui ----------
-    def add(self, line):
-        self.log.text += line + "\n\n"
-        Clock.schedule_once(lambda dt: setattr(self.scroll, "scroll_y", 0), 0.1)
+    # ---------- voice input: Always Listen (SpeechRecognizer loop) ----------
+    def toggle_listen(self, *_):
+        if not ANDROID:
+            self.add("Always Listen works only on Android.")
+            return
+        self.wake()
+        if self.always:
+            self.stop_always()
+            self.say("Always listen off.")
+            return
+        if not check_permission(Permission.RECORD_AUDIO):
+            request_permissions([Permission.RECORD_AUDIO])
+            self.say("Allow the microphone, then tap Listen again.")
+            return
+        self.always = True
+        self.sr_fail = 0
+        self.refresh_buttons()
+        self.say("Always listen on. Say mini, then your command.")
+        self.loop_later(2.5)
 
-    def say(self, text):
-        self.add("mini: " + text)
-        self.speak(text)
+    def stop_always(self):
+        self.always = False
+        Clock.unschedule(self.start_loop)
+        self.ui_sr_stop()
+        self.refresh_buttons()
 
-    def on_send(self, *_):
-        text = self.inp.text
-        self.inp.text = ""
-        self.handle(text)
+    def loop_later(self, delay):
+        Clock.unschedule(self.start_loop)
+        Clock.schedule_once(self.start_loop, delay)
 
-    # ---------- key ----------
-    def key_path(self):
-        return os.path.join(self.user_data_dir, "gemini_key.txt")
+    def start_loop(self, dt=None):
+        if not (ANDROID and self.always) or self.asleep:
+            return
+        if self.is_speaking():
+            Clock.schedule_once(self.start_loop, 0.8)
+            return
+        self.ui_sr_start()
 
-    def load_key(self):
+    @run_on_ui_thread
+    def ui_sr_start(self):
         try:
-            with open(self.key_path()) as f:
-                return f.read().strip()
+            if self.sr is None:
+                self.sr = SpeechRecognizer.createSpeechRecognizer(PythonActivity.mActivity)
+                self.sr.setRecognitionListener(self.rec_listener)
+            i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+            i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            self.sr.startListening(i)
+        except Exception as e:
+            msg = str(e)
+            Clock.schedule_once(lambda dt: self.on_rec_error(5, msg))
+
+    @run_on_ui_thread
+    def ui_sr_stop(self):
+        try:
+            if self.sr is not None:
+                self.sr.cancel()
         except Exception:
-            return ""
+            pass
 
-    def save_key(self, *_):
-        key = self.key_inp.text.strip()
-        if not key:
+    @run_on_ui_thread
+    def ui_sr_destroy(self):
+        try:
+            if self.sr is not None:
+                self.sr.destroy()
+        except Exception:
+            pass
+        self.sr = None
+
+    def sr_text_cb(self, text):
+        Clock.schedule_once(lambda dt: self.on_rec_result(text))
+
+    def sr_err_cb(self, code):
+        Clock.schedule_once(lambda dt: self.on_rec_error(code))
+
+    def on_rec_result(self, text):
+        self.sr_fail = 0
+        if text and (WAKE.search(text.lower()) or time.time() < self.conv_until):
+            self.handle(text)
+        self.loop_later(0.6)
+
+    def on_rec_error(self, code, msg=""):
+        if not self.always:
             return
-        with open(self.key_path(), "w") as f:
-            f.write(key)
-        self.key_inp.text = ""
-        self.add("(Gemini API key saved)")
-
-    # ---------- tts ----------
-    def init_tts(self):
-        def on_init(status):
-            if status == TextToSpeech.SUCCESS:
-                self.tts.setLanguage(Locale.US)
-                self.tts_ready = True
-                if self.pending:
-                    self.tts.speak(self.pending, TextToSpeech.QUEUE_FLUSH, None)
-                    self.pending = None
-
-        self.tts_listener = TTSInit(on_init)
-        self.tts = TextToSpeech(PythonActivity.mActivity, self.tts_listener)
-
-    def speak(self, text):
-        if not ANDROID or self.tts is None:
+        if code == 9:
+            self.stop_always()
+            self.say("I need microphone permission for always listen.")
             return
-        clean = re.sub(r"[*_#`]", "", text)
-        if self.tts_ready:
-            self.tts.speak(clean, TextToSpeech.QUEUE_FLUSH, None)
-        else:
-            self.pending = clean
+        if code in (6, 7):  # silence / no match: just listen again
+            self.loop_later(0.3)
+            return
+        self.sr_fail += 1
+        if self.sr_fail >= 5:
+            self.stop_always()
+            self.say("Always listen stopped. Microphone error %s. %s" % (code, msg))
+            return
+        self.ui_sr_destroy()
+        self.loop_later(1.5)
 
-    # ---------- command handler ----------
+    # ---------- command handling ----------
     def handle(self, text):
         t = text.strip()
         if not t:
             return
-        self.add("You: " + t)
-        low = t.lower().strip(" .!?")
+        self.wake()
+        kind, p = self.brain.route(t)
+        if kind in ("vault_save", "vault_get"):
+            self.add("You: (password command)")
+        elif kind != "empty":
+            self.add("You: " + t)
+        self.save_settings()
 
-        # Hard off
-        if "mini off" in low or "mic off" in low:
-            self.hard_off = True
-            self.always_listen = False
-            self.stop_speech_loop()
-            return self.say("Mic off. Goodbye boss.")
+        if kind in ("say", "vault_save", "vault_get"):
+            self.say(p)
+        elif kind == "stop":
+            self.sleep_now(None)
+            self.say(p)
+        elif kind == "off":
+            self.say(p)
+            Clock.schedule_once(lambda dt: self.stop(), 2.5)
+        elif kind == "online":
+            self.set_mode(p)
+        elif kind == "model":
+            self.model = p
+            self.save_settings()
+            self.say("Model set to %s." % p)
+        elif kind == "cc":
+            self.cc = p
+            self.save_settings()
+            self.say("Country code set to plus %s." % p)
+        elif kind == "call":
+            self.say(self.act_call(p))
+        elif kind == "open":
+            self.say(self.act_open(p))
+        elif kind == "search":
+            self.say(self.act_search(p))
+        elif kind == "whatsapp":
+            self.say(self.act_whatsapp(p))
+        elif kind == "weather":
+            self.act_weather(*p)
+        elif kind == "ai":
+            if self.online:
+                self.ask_ai(p)
+            else:
+                self.say("I am offline. Switch to online mode for chat.")
 
-        # Mode switch
-        if "online mode" in low or "online mood" in low:
-            self.mode = "online"
-            self.mode_btn.text = "MODE: ONLINE"
-            self.mode_btn.background_color = (0.2, 0.4, 0.8, 1)
-            self.last_proactive = time.time()
-            return self.say("Online mode on.")
-        if "offline mode" in low or "offline mood" in low:
-            self.mode = "offline"
-            self.mode_btn.text = "MODE: OFFLINE"
-            self.mode_btn.background_color = (0.2, 0.6, 0.2, 1)
-            return self.say("Offline mode on.")
+    # ---------- phone actions ----------
+    def start_activity(self, intent):
+        PythonActivity.mActivity.startActivity(intent)
 
-        # Proactive switch
-        if "proactive on" in low or "proactive mood on" in low:
-            if self.mode != "online":
-                return self.say("Proactive needs online mode.")
-            self.proactive_on = True
-            self.proactive_btn.text = "PROACTIVE: ON"
-            self.proactive_btn.background_color = (0.2, 0.7, 0.4, 1)
-            self.last_proactive = time.time()
-            return self.say("Proactive mode on.")
-        if "proactive off" in low or "proactive mood off" in low:
-            self.proactive_on = False
-            self.proactive_btn.text = "PROACTIVE: OFF"
-            self.proactive_btn.background_color = (0.3, 0.3, 0.5, 1)
-            return self.say("Proactive mode off.")
-
-        # Offline commands
-        m = re.match(r"^(?:call|phone|dial)\s+(.+)$", low)
-        if m:
-            return self.say(self.act_call(m.group(1)))
-        m = re.match(r"^(?:open|launch|start)\s+(.+)$", low)
-        if m:
-            return self.say(self.act_open(m.group(1)))
-        m = re.match(r"^(?:search|google)(?: for)?\s+(.+)$", low)
-        if m:
-            return self.say(self.act_search(m.group(1)))
-        if re.fullmatch(r"(what(?:'s| is)? the time|what time is it|time)", low):
-            return self.say(datetime.datetime.now().strftime("It is %I:%M %p."))
-
-        if self.mode == "offline":
-            return self.say("Offline mode. Say 'online mode' for chat.")
-        self.ask_ai(t)
+    def need_contacts(self, need_call=False):
+        perms = [Permission.READ_CONTACTS] + ([Permission.CALL_PHONE] if need_call else [])
+        if all(check_permission(p) for p in perms):
+            return False
+        request_permissions(perms)
+        return True
 
     def act_call(self, name):
         if not ANDROID:
-            return "Calling works only on phone."
-        if not (check_permission(Permission.READ_CONTACTS) and check_permission(Permission.CALL_PHONE)):
-            request_permissions([Permission.READ_CONTACTS, Permission.CALL_PHONE])
-            return "Grant contacts and phone permission, then try again."
+            return "Calling works only on the phone."
+        if self.need_contacts(True):
+            return "I need contacts and phone permission. Allow it, then say that again."
         try:
             number = find_number(name)
             if not number:
-                return "I could not find %s." % name
-            PythonActivity.mActivity.startActivity(Intent(Intent.ACTION_CALL, Uri.parse("tel:" + number)))
+                return "I could not find %s in your contacts." % name
+            self.start_activity(Intent(Intent.ACTION_CALL, Uri.parse("tel:" + number)))
             return "Calling %s." % name
         except Exception as e:
             return "Call failed: %s" % e
 
+    def act_whatsapp(self, name):
+        if not ANDROID:
+            return "WhatsApp works only on the phone."
+        if self.need_contacts():
+            return "I need contacts permission. Allow it, then say that again."
+        try:
+            number = find_number(name)
+            if not number:
+                return "I could not find %s in your contacts." % name
+            if not number.startswith("+"):
+                number = "+" + self.cc + number.lstrip("0")
+            i = Intent(Intent.ACTION_VIEW, Uri.parse("https://wa.me/" + number.lstrip("+")))
+            i.setPackage("com.whatsapp")
+            self.start_activity(i)
+            return "Opening WhatsApp chat with %s." % name
+        except Exception as e:
+            return "WhatsApp failed: %s" % e
+
     def act_open(self, name):
         if not ANDROID:
-            return "Opening apps works only on phone."
+            return "Opening apps works only on the phone."
         try:
-            act = PythonActivity.mActivity
-            pm = act.getPackageManager()
+            pm = PythonActivity.mActivity.getPackageManager()
             i = Intent(Intent.ACTION_MAIN)
             i.addCategory(Intent.CATEGORY_LAUNCHER)
             apps = pm.queryIntentActivities(i, 0)
@@ -602,40 +1248,70 @@ class Mini(App):
                 ri = cast("android.content.pm.ResolveInfo", apps.get(k))
                 label = ri.loadLabel(pm).toString().lower()
                 if name in label:
-                    act.startActivity(pm.getLaunchIntentForPackage(ri.activityInfo.packageName))
+                    self.start_activity(pm.getLaunchIntentForPackage(ri.activityInfo.packageName))
                     return "Opening %s." % label
-            return "No app called %s." % name
+            for pkg in APP_ALIASES.get(name, []):
+                li = pm.getLaunchIntentForPackage(pkg)
+                if li is not None:
+                    self.start_activity(li)
+                    return "Opening %s." % name
+            return "I could not find an app called %s." % name
         except Exception as e:
             return "Open failed: %s" % e
 
     def act_search(self, query):
         if not ANDROID:
-            return "Search works only on phone."
+            return "Search works only on the phone."
         try:
             url = "https://www.google.com/search?q=" + urllib.parse.quote(query)
-            PythonActivity.mActivity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+            self.start_activity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
             return "Searching for %s." % query
         except Exception as e:
             return "Search failed: %s" % e
 
-    # ---------- gemini ----------
-    def ask_ai(self, text):
-        key = self.load_key()
-        if not key:
-            return self.say("Save Gemini API key first.")
-        self.history.append({"role": "user", "content": text})
-        self.history = self.history[-11:]
-        while self.history and self.history[0]["role"] != "user":
-            self.history.pop(0)
-        msgs = list(self.history)
-        self.add("(thinking...)")
+    # ---------- weather (online) ----------
+    def act_weather(self, lang, city):
+        if not self.online:
+            return self.say("Weather needs internet. Switch to online mode.")
+        self.set_state("thinking", 30)
 
         def worker():
             try:
-                reply = call_gemini(key, msgs)
+                temp, unit, cond = fetch_weather(city)
+                r = self.brain.weather_reply(lang, temp, unit, cond)
+                Clock.schedule_once(lambda dt, x=r: self.say(x))
+            except Exception:
+                Clock.schedule_once(lambda dt: self.say("I could not get the weather right now."))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ---------- Gemini (online mode) ----------
+    def ask_ai(self, text):
+        key = self.store.read_text("gemini_key.txt")
+        if not key:
+            return self.say("Paste your Gemini API key below and tap Save key.")
+        self.history.append({"role": "user", "parts": [{"text": text}]})
+        self.history = self.history[-11:]
+        while self.history and self.history[0]["role"] != "user":
+            self.history.pop(0)
+        contents = list(self.history)
+        model = self.model
+        system = self.brain.system_prompt()
+        self.set_state("thinking", 60)
+
+        def worker():
+            try:
+                reply = call_gemini(key, model, system, contents)
                 Clock.schedule_once(lambda dt, r=reply: self.on_ai(r))
             except urllib.error.HTTPError as e:
-                msg = "AI error %s." % e.code
+                if e.code in (400, 403):
+                    msg = "Google rejected the request. Check your API key."
+                elif e.code == 404:
+                    msg = "Model not found. Type: use model gemini-3.1-flash-lite"
+                elif e.code == 429:
+                    msg = "Too many requests. Wait a minute and try again."
+                else:
+                    msg = "AI error %s." % e.code
                 Clock.schedule_once(lambda dt, m=msg: self.on_ai_fail(m))
             except Exception as e:
                 msg = "AI error: %s" % e
@@ -644,8 +1320,10 @@ class Mini(App):
         threading.Thread(target=worker, daemon=True).start()
 
     def on_ai(self, reply):
-        self.history.append({"role": "assistant", "content": reply})
-        self.say(reply or "No answer.")
+        if not reply:
+            return self.say("I have no answer for that.")
+        self.history.append({"role": "model", "parts": [{"text": reply}]})
+        self.say(self.brain.parse_ai(reply))
 
     def on_ai_fail(self, msg):
         if self.history and self.history[-1]["role"] == "user":
