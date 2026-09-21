@@ -6,20 +6,14 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    container:
+      image: kivy/buildozer:1.1.0
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-      - name: Install dependencies
+      - name: Build APK
         run: |
-          sudo apt update
-          sudo apt install -y git zip unzip openjdk-17-jdk python3-pip autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev cmake libffi-dev libssl-dev
-          pip3 install --user --upgrade buildozer cython
-      - name: Build with Buildozer
-        run: |
-          export PATH=$PATH:~/.local/bin
-          buildozer android debug
+          export BUILDOZER_ALLOW_ROOT=1
+          yes | buildozer android debug
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
