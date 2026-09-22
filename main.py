@@ -53,6 +53,11 @@ if ANDROID:
     SpeechRecognizer = autoclass("android.speech.SpeechRecognizer")
     TextToSpeech = autoclass("android.speech.tts.TextToSpeech")
     Locale = autoclass("java.util.Locale")
+    Context = autoclass("android.content.Context")
+    Settings = autoclass("android.provider.Settings")
+    AudioManager = autoclass("android.media.AudioManager")
+    IntentFilter = autoclass("android.content.IntentFilter")
+    SmsManager = autoclass("android.telephony.SmsManager")
 
     class TTSInit(PythonJavaClass):
         __javainterfaces__ = ["android/speech/tts/TextToSpeech$OnInitListener"]
@@ -154,31 +159,23 @@ def segments(text, base):
 RESP = {
     "hello": {
         "normal": ("नमस्ते {n}! कैसे हो?", "Namaste {n}! Kaise ho?"),
-        "personal": ("नमस्ते {n}! आप कैसे हो जान?", "Namaste {n}! Aap kaise ho jaan?"),
-        "gf": ("Hello jaan! आपकी बहुत याद आ रही थी।", "Hello jaan! Aapki bahut yaad aa rahi thi."),
+        "personal": ("नमस्ते {n}! आप कैसे हो?", "Namaste {n}! Aap kaise ho?"),
     },
     "kaise": {
         "normal": ("मैं ठीक हूँ! आप कैसे हो?", "Main theek hoon! Aap kaise ho?"),
         "personal": (
-            "मैं ठीक हूँ, आपसे बात करके अच्छा लगा। आप कैसे हो जान?",
-            "Main theek hoon, aapse baat karke accha laga. Aap kaise ho jaan?",
-        ),
-        "gf": (
-            "आपके बिना थोड़ा उदास थी, अब ठीक हूँ। आप कैसे हो जान?",
-            "Aapke bina thoda udaas thi, ab theek hoon. Aap kaise ho jaan?",
+            "मैं ठीक हूँ, आपसे बात करके अच्छा लगा। आप कैसे हो {n}?",
+            "Main theek hoon, aapse baat karke accha laga. Aap kaise ho {n}?",
         ),
     },
     "howare": {"normal": ("मैं ठीक हूँ", "Main theek hoon")},
-    "thanks": {"normal": ("आपका स्वागत है", "Aapka swagat hai")},
+    "thanks": {"normal": ("आपका स्वागत है {n}", "Aapka swagat hai {n}")},
     "name": {"normal": ("मेरा नाम मिनी है", "Mera naam Mini hai")},
     "gmorning": {
         "normal": ("गुड मॉर्निंग {n}! आप कैसे हो?", "Good morning {n}! Aap kaise ho?"),
-        "gf": ("Good morning jaan! आपने अच्छे से सोया?", "Good morning jaan! Aapne accha se soya?"),
     },
     "love": {
-        "normal": ("आई लव यू टू {n}!", "I love you too {n}!"),
-        "personal": ("I love you too jaan!", "I love you too jaan!"),
-        "gf": ("I love you too jaan! Muah!", "I love you too jaan! Muah!"),
+        "normal": ("धन्यवाद {n}, मैं यहाँ मदद के लिए हूँ।", "Dhanyavad {n}, main yahan madad ke liye hoon."),
     },
     "sorry": {"normal": ("कोई बात नहीं {n}!", "Koi baat nahin {n}!")},
     "yes": {"normal": ("ओके {n}!", "Okay {n}!")},
@@ -201,29 +198,18 @@ PATTERNS = [
 LOVE = r"i love you|love you|i love u|आई लव यू"
 ASK_AFTER = {"hello", "kaise", "howare", "gmorning", "thanks", "yes", "no", "ok", "sorry"}
 
-GF_QUESTIONS = [
-    R("आप अभी क्या कर रहे हो?", "Aap abhi kya kar rahe ho?"),
-    R("आपने खाना खाया?", "Aapne khana khaya?"),
-    R("आज आपका दिन कैसा रहा?", "Aaj aapka din kaisa raha?"),
-    R("What are you thinking about right now?"),
-]
 PERS_QUESTIONS = [
-    R("आप कैसे हो जान?", "Aap kaise ho jaan?"),
+    R("आप कैसे हो {n}?", "Aap kaise ho {n}?"),
     R("क्या कर रहे हो?", "Kya kar rahe ho?"),
     R("आज का दिन कैसा रहा?", "Aaj ka din kaisa raha?"),
 ]
 PROACTIVE = {
     "normal": [
-        R("क्या आपको कुछ चाहिए?", "Kya aapko kuch chahiye?"),
+        R("क्या आपको कुछ चाहिए {n}?", "Kya aapko kuch chahiye {n}?"),
         R("मैं यहीं हूँ, बताइए।", "Main yahin hoon, bataiye."),
-        R("I am here if you need me."),
+        R("I am here if you need me, {n}."),
     ],
-    "personal": PERS_QUESTIONS + [R("I miss you.")],
-    "gf": [
-        R("मैं आपको याद कर रही हूँ जान।", "Main aapko yaad kar rahi hoon jaan."),
-        R("I miss you jaan!"),
-        R("आप क्या कर रहे हो?", "Aap kya kar rahe ho?"),
-    ],
+    "personal": PERS_QUESTIONS + [R("Boss, aaj kaisa din tha?", "Boss, aaj kaisa din tha?")],
 }
 
 APP_ALIASES = {
@@ -372,20 +358,15 @@ class Brain:
     def system_prompt(self):
         base = (
             "You are mini, a JARVIS-like voice assistant on an Android phone. "
-            "The user's nickname is %s. Answer in one or two short spoken sentences. "
+            "Always address the user only as %s, never any other name or pet name. "
+            "Never use romantic language. Answer in one or two short spoken sentences. "
             "Reply in the language the user used: English or Hindi. "
             "For an English reply output exactly: EN@@<text> "
             "For a Hindi reply output exactly: HI@@<Hindi in Devanagari script>@@<the same sentence in Roman letters> "
             "Write numbers as digits. No markdown, no emojis. Never use Bengali."
         ) % self.nick
         if self.mood == "personal":
-            base += " Use a soft, caring, warm tone and sometimes ask how the user is."
-        elif self.mood == "gf":
-            base += (
-                " Speak like an affectionate, playful girlfriend using words like jaan, "
-                "in Hindi or English only. Keep it sweet and never explicit. "
-                "Sometimes ask a friendly question back."
-            )
+            base += " Use a soft, caring, but respectful and non-romantic tone, and sometimes ask how the user is."
         return base
 
     def parse_ai(self, text):
@@ -405,9 +386,9 @@ class Brain:
         table = RESP[key]
         sp, sh = table.get(self.mood) or table["normal"]
         r = self.fmt(R(sp, sh))
-        if key in ASK_AFTER and self.mood in ("gf", "personal") and not r.shown.rstrip().endswith("?"):
-            if self.mood == "gf" or self.rnd.random() < 0.5:
-                q = self.rnd.choice(GF_QUESTIONS if self.mood == "gf" else PERS_QUESTIONS)
+        if key in ASK_AFTER and self.mood == "personal" and not r.shown.rstrip().endswith("?"):
+            if self.rnd.random() < 0.5:
+                q = self.fmt(self.rnd.choice(PERS_QUESTIONS))
                 r = Reply(r.spoken + " " + q.spoken, r.shown + " " + q.shown)
         return r
 
@@ -450,25 +431,22 @@ class Brain:
         if re.fullmatch(r"good ?night|gud night|shubh ratri|शुभ रात्रि", low):
             if self.mood == "normal":
                 return ("stop", self.fmt(R("Good night {n}!")))
-            return ("stop", self.fmt(R("Good night jaan! Sweet dreams.")))
+            return ("stop", self.fmt(R("Good night {n}! Sweet dreams.")))
 
         # online / offline
         m = re.fullmatch(r"(?:(?:go|switch|turn|set)(?: to)? )?(online|offline)(?: mode)?", low)
         if m:
             return ("online", m.group(1) == "online")
 
-        # moods
-        if re.fullmatch(
-            r"(?:girlfriend|gf|personal) (?:mode|mood) off|normal (?:mode|mood)|normal ho ja(?:o)?", low
-        ):
+        # moods (girlfriend mode is not supported - mini stays a respectful assistant)
+        if re.fullmatch(r"personal (?:mode|mood) off|normal (?:mode|mood)|normal ho ja(?:o)?", low):
             self.mood = "normal"
             return ("say", R("Normal mode on."))
         if re.fullmatch(r"(?:girlfriend|gf) (?:mode|mood)(?: on| chalu)?", low):
-            self.mood = "gf"
-            return ("say", R("Girlfriend mode on. Hi jaan!"))
+            return ("say", self.fmt(R("I do not have a girlfriend mode, {n}. I can switch to personal mode instead.")))
         if re.fullmatch(r"personal (?:mode|mood)(?: on)?|पर्सनल मोड", low):
             self.mood = "personal"
-            return ("say", R("ठीक है, पर्सनल मोड चालू। आप कैसे हो जान?", "Theek hai, personal mode on. Aap kaise ho jaan?"))
+            return ("say", self.fmt(R("ठीक है, पर्सनल मोड चालू। आप कैसे हो?", "Theek hai, personal mode on. Aap kaise ho?")))
 
         # settings
         m = re.match(r"^(?:use|set) model\s+(\S+)$", raw.strip(" .!?"), re.I)
@@ -508,6 +486,50 @@ class Brain:
         for key, rx in PATTERNS:
             if re.fullmatch(rx, low):
                 return ("say", self._mood_reply(key))
+
+        # phone hardware controls (checked before the generic open/call handlers below,
+        # so "open wifi settings" does not get treated as "open an app called wifi settings")
+        if re.fullmatch(
+            r"(?:turn on|switch on) (?:the )?(?:torch|flash|flashlight)|(?:torch|flash|flashlight) on|"
+            r"torch jalao|flash jalao|light jalao",
+            low,
+        ):
+            return ("torch", True)
+        if re.fullmatch(
+            r"(?:turn off|switch off) (?:the )?(?:torch|flash|flashlight)|(?:torch|flash|flashlight) off|"
+            r"torch bandh karo|flash bandh karo|light bandh karo",
+            low,
+        ):
+            return ("torch", False)
+        if re.fullmatch(r"volume up|increase volume|awaaz badhao|volume badhao|volume badha do", low):
+            return ("volume", "up")
+        if re.fullmatch(r"volume down|decrease volume|awaaz kam karo|volume kam karo", low):
+            return ("volume", "down")
+        if re.fullmatch(r"(?:full|max(?:imum)?) volume|volume max|volume full karo", low):
+            return ("volume", "max")
+        if re.fullmatch(r"mute|mute (?:the )?volume|awaaz band karo|volume band karo|silent", low):
+            return ("volume", "mute")
+        if re.fullmatch(r"unmute|volume on|awaaz chalu karo", low):
+            return ("volume", "unmute")
+        if re.fullmatch(r"(?:open )?wifi(?: settings)?|wifi kholo|wifi on karo|wifi off karo", low):
+            return ("settings", "wifi")
+        if re.fullmatch(
+            r"(?:open )?bluetooth(?: settings)?|bluetooth kholo|bluetooth on karo|bluetooth off karo", low
+        ):
+            return ("settings", "bluetooth")
+        if re.fullmatch(r"open settings|phone settings|settings kholo", low):
+            return ("settings", "settings")
+        if re.search(r"battery (?:percentage|status|level)?|battery kitni hai|kitni battery hai", low):
+            return ("battery", None)
+
+        # send sms
+        m = re.match(
+            r"^(?:send )?(?:message|sms|text)\s+(.+?)\s+(?:saying|that says|ki|likh(?:o|ke))\s+(.+)$",
+            raw,
+            re.I,
+        ) or re.match(r"^(.+?)\s+ko\s+(?:message|sms)\s+(?:bhejo|karo)\s+(.+)$", raw, re.I)
+        if m:
+            return ("sms", (m.group(1).strip(), m.group(2).strip()))
 
         # phone commands
         m = re.match(r"^whatsapp\s+(?:me\s+|mein\s+)?(.+)$", low)
@@ -581,12 +603,13 @@ class Brain:
 
 
 # ================================================================ Orb (UI)
-STATE_SPEED = {"idle": 18, "listening": 45, "thinking": 130, "speaking": 60, "sleep": 6}
-STATE_AMP = {"idle": 0.02, "listening": 0.05, "thinking": 0.03, "speaking": 0.05, "sleep": 0.01}
+STATE_SPEED = {"idle": 10, "listening": 42, "thinking": 115, "speaking": 55, "sleep": 3}
+STATE_AMP = {"idle": 0.03, "listening": 0.07, "thinking": 0.045, "speaking": 0.08, "sleep": 0.01}
+STATE_GLOW = {"idle": 1.0, "listening": 1.6, "thinking": 1.35, "speaking": 1.9, "sleep": 0.4}
 
 
 class Orb(Widget):
-    """Golden particle sphere that always spins anticlockwise."""
+    """JARVIS style pulsing golden rings. Always turns anticlockwise."""
 
     def __init__(self, **kw):
         super().__init__(**kw)
@@ -594,39 +617,25 @@ class Orb(Widget):
         self.tap_cb = None
         self.t = 0.0
         self.ang = 0.0
-        self.spin = 0.0
-        self.amp = 0.02
-
-        rnd = random.Random(7)
-        pts = []
-        n = 300
-        for i in range(n):
-            y = 1 - 2 * (i + 0.5) / n
-            r = math.sqrt(1 - y * y)
-            th = i * 2.399963
-            k = 0.7 + 0.3 * rnd.random()
-            pts.append((math.cos(th) * r * k, y * k, math.sin(th) * r * k))
-        for tilt, off in ((0.5, 0.0), (1.2, 1.0), (2.0, 2.1)):
-            ct, st = math.cos(tilt), math.sin(tilt)
-            co, so = math.cos(off), math.sin(off)
-            for j in range(90):
-                a = j * 2 * math.pi / 90
-                x, y, z = math.cos(a), math.sin(a) * ct, math.sin(a) * st
-                pts.append((x * co - y * so, x * so + y * co, z))
-        self.pts = pts
+        self.amp = 0.03
 
         with self.canvas:
             self.c_g2 = Color(0.9, 0.5, 0.05, 0.10)
             self.glow2 = Ellipse()
-            self.c_g1 = Color(1, 0.65, 0.1, 0.16)
+            self.c_g1 = Color(1, 0.65, 0.1, 0.18)
             self.glow1 = Ellipse()
-            Color(1, 0.65, 0.15, 0.40)
-            self.p_back = Point(pointsize=dp(1.3))
-            Color(1, 0.85, 0.4, 0.95)
-            self.p_front = Point(pointsize=dp(2.2))
-            Color(1, 0.75, 0.2, 0.55)
-            self.ring = Line(circle=(0, 0, 1), width=dp(1))
-            Color(1, 0.93, 0.65, 0.9)
+
+            Color(1, 0.72, 0.15, 0.9)
+            self.ring_out = Line(width=dp(1.6))
+            Color(1, 0.65, 0.1, 0.7)
+            self.ring_mid = Line(width=dp(1.3), dash_length=dp(9), dash_offset=dp(6))
+            Color(1, 0.55, 0.05, 0.55)
+            self.ring_in = Line(width=dp(1.1), dash_length=dp(5), dash_offset=dp(4))
+
+            Color(1, 0.8, 0.3, 0.9)
+            self.ticks = Point(pointsize=dp(1.8))
+
+            Color(1, 0.95, 0.7, 1)
             self.core = Ellipse()
         Clock.schedule_interval(self.tick, 1 / 30.0)
 
@@ -640,44 +649,40 @@ class Orb(Widget):
         st = self.state
         self.t += dt
         self.ang += STATE_SPEED[st] * dt  # positive angle = anticlockwise on screen
-        self.spin += 0.5 * dt
 
         target = STATE_AMP[st]
         if st == "speaking":
-            target = 0.04 + 0.10 * abs(math.sin(self.t * 8) * math.sin(self.t * 2.7))
+            target = 0.05 + 0.09 * abs(math.sin(self.t * 8) * math.sin(self.t * 2.6))
         self.amp += (target - self.amp) * min(1.0, dt * 8)
-        pulse = 1.0 if st == "speaking" else math.sin(self.t * 2.5)
-        scale = 1 + self.amp * pulse
+        breathe = 1.0 if st == "speaking" else math.sin(self.t * 2.2)
+        scale = 1 + self.amp * breathe
 
         cx, cy = self.center_x, self.center_y
-        R_ = min(self.width, self.height) * 0.40 * scale
+        R_ = min(self.width, self.height) * 0.42 * scale
 
-        th = math.radians(self.ang)
-        ct, sn = math.cos(th), math.sin(th)
-        cp, sp = math.cos(self.spin), math.sin(self.spin)
-        back, front = [], []
-        for x, y, z in self.pts:
-            x1 = x * cp + z * sp
-            z1 = z * cp - x * sp
-            px = cx + R_ * (x1 * ct - y * sn)
-            py = cy + R_ * (x1 * sn + y * ct)
-            if z1 > 0:
-                front.extend((px, py))
-            else:
-                back.extend((px, py))
-        self.p_back.points = back
-        self.p_front.points = front
+        self.ring_out.circle = (cx, cy, R_)
+        self.ring_mid.circle = (cx, cy, R_ * 0.78)
+        self.ring_mid.dash_offset = self.ang % 100
+        self.ring_in.circle = (cx, cy, R_ * 0.56)
+        self.ring_in.dash_offset = (self.ang * 1.7) % 100
 
-        g1, g2 = R_ * 1.25, R_ * 1.6
+        pts = []
+        for i in range(12):
+            a = math.radians(i * 30 + self.ang)
+            r = R_ * 0.90
+            pts.extend((cx + r * math.cos(a), cy + r * math.sin(a)))
+        self.ticks.points = pts
+
+        g1, g2 = R_ * 1.3, R_ * 1.65
         self.glow1.pos = (cx - g1, cy - g1)
         self.glow1.size = (2 * g1, 2 * g1)
         self.glow2.pos = (cx - g2, cy - g2)
         self.glow2.size = (2 * g2, 2 * g2)
-        boost = 1.8 if st in ("speaking", "listening") else (0.5 if st == "sleep" else 1.0)
+        boost = STATE_GLOW[st]
         self.c_g1.a = min(0.4, 0.16 * boost)
-        self.c_g2.a = min(0.25, 0.10 * boost)
-        self.ring.circle = (cx, cy, R_ * 1.12)
-        rc = R_ * 0.09 * (1 + 2 * self.amp)
+        self.c_g2.a = min(0.28, 0.10 * boost)
+
+        rc = R_ * 0.12 * (1 + 1.6 * self.amp)
         self.core.pos = (cx - rc, cy - rc)
         self.core.size = (2 * rc, 2 * rc)
 
@@ -719,6 +724,27 @@ def fetch_weather(city):
     return m.group(1).lstrip("+"), m.group(2), m.group(3) or "clear"
 
 
+def fetch_instant_answer(query):
+    """A short spoken answer from DuckDuckGo's instant-answer API, or None if it has nothing."""
+    url = "https://api.duckduckgo.com/?q=%s&format=json&no_html=1&skip_disambig=1" % urllib.parse.quote(
+        query
+    )
+    req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
+    with urllib.request.urlopen(req, timeout=12, context=ssl_context()) as r:
+        data = json.loads(r.read().decode("utf-8", "ignore"))
+    text = (data.get("AbstractText") or data.get("Answer") or "").strip()
+    if not text:
+        topics = data.get("RelatedTopics") or []
+        for t in topics:
+            if isinstance(t, dict) and t.get("Text"):
+                text = t["Text"].strip()
+                break
+    if not text:
+        return None
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    return " ".join(sentences[:2])[:400]
+
+
 def find_number(name):
     act = PythonActivity.mActivity
     phone = autoclass("android.provider.ContactsContract$CommonDataKinds$Phone")
@@ -735,6 +761,24 @@ def find_number(name):
         finally:
             cur.close()
     return found
+
+
+def find_name(number):
+    """Reverse lookup: saved contact name for an incoming phone number, or None."""
+    if not number:
+        return None
+    act = PythonActivity.mActivity
+    lookup = autoclass("android.provider.ContactsContract$PhoneLookup")
+    uri = Uri.withAppendedPath(lookup.CONTENT_FILTER_URI, Uri.encode(number))
+    cur = act.getContentResolver().query(uri, ["display_name"], None, None, None)
+    name = None
+    if cur is not None:
+        try:
+            if cur.moveToFirst():
+                name = cur.getString(0)
+        finally:
+            cur.close()
+    return name
 
 
 def styled_button(text, **kw):
@@ -784,6 +828,8 @@ class Mini(App):
         self.always = False
         self.asleep = False
         self.sr_fail = 0
+        self.call_receiver = None
+        self.last_call_key = None
         now = time.time()
         self.last_user = now
         self.last_any = now
@@ -840,10 +886,18 @@ class Mini(App):
         if ANDROID:
             android_activity.bind(on_activity_result=self.on_activity_result)
             request_permissions(
-                [Permission.RECORD_AUDIO, Permission.READ_CONTACTS, Permission.CALL_PHONE]
+                [
+                    Permission.RECORD_AUDIO,
+                    Permission.READ_CONTACTS,
+                    Permission.CALL_PHONE,
+                    Permission.SEND_SMS,
+                    Permission.READ_PHONE_STATE,
+                    Permission.READ_CALL_LOG,
+                ]
             )
             self.init_tts()
             self.rec_listener = RecListener(self.sr_text_cb, self.sr_err_cb)
+            self.start_call_watcher()
         self.say(self.brain.greeting())
         Clock.schedule_interval(self.housekeeping, 15)
 
@@ -852,6 +906,11 @@ class Mini(App):
 
     def on_stop(self):
         self.ui_sr_destroy()
+        if self.call_receiver is not None:
+            try:
+                self.call_receiver.stop()
+            except Exception:
+                pass
         if self.tts is not None:
             try:
                 self.tts.shutdown()
@@ -1182,9 +1241,19 @@ class Mini(App):
         elif kind == "open":
             self.say(self.act_open(p))
         elif kind == "search":
-            self.say(self.act_search(p))
+            self.act_search(p)
         elif kind == "whatsapp":
             self.say(self.act_whatsapp(p))
+        elif kind == "torch":
+            self.say(self.act_torch(p))
+        elif kind == "volume":
+            self.say(self.act_volume(p))
+        elif kind == "settings":
+            self.say(self.act_settings(p))
+        elif kind == "battery":
+            self.say(self.act_battery())
+        elif kind == "sms":
+            self.say(self.act_sms(*p))
         elif kind == "weather":
             self.act_weather(*p)
         elif kind == "ai":
@@ -1196,6 +1265,47 @@ class Mini(App):
     # ---------- phone actions ----------
     def start_activity(self, intent):
         PythonActivity.mActivity.startActivity(intent)
+
+    # ---------- caller announcement ----------
+    def start_call_watcher(self):
+        try:
+            from android.broadcast import BroadcastReceiver
+
+            self.call_receiver = BroadcastReceiver(
+                self.on_phone_broadcast, actions=["android.intent.action.PHONE_STATE"]
+            )
+            self.call_receiver.start()
+        except Exception as e:
+            msg = str(e)
+            Clock.schedule_once(lambda dt: self.add("(call announcement unavailable: %s)" % msg))
+
+    def on_phone_broadcast(self, context, intent):
+        try:
+            state = intent.getStringExtra("state")
+            number = intent.getStringExtra("incoming_number")
+        except Exception:
+            return
+        Clock.schedule_once(lambda dt: self.handle_call_state(state, number))
+
+    def handle_call_state(self, state, number):
+        if state != "RINGING":
+            if state == "IDLE":
+                self.last_call_key = None
+            return
+        key = number or "unknown"
+        if key == self.last_call_key:
+            return
+        self.last_call_key = key
+        if not number:
+            return self.say("Someone is calling, but I could not read the number.")
+        try:
+            name = find_name(number)
+        except Exception:
+            name = None
+        if name:
+            self.say("%s is calling." % name)
+        else:
+            self.say("An unknown number is calling: " + " ".join(number))
 
     def need_contacts(self, need_call=False):
         perms = [Permission.READ_CONTACTS] + ([Permission.CALL_PHONE] if need_call else [])
@@ -1236,6 +1346,91 @@ class Mini(App):
         except Exception as e:
             return "WhatsApp failed: %s" % e
 
+    def act_torch(self, on):
+        if not ANDROID:
+            return "Torch works only on the phone."
+        try:
+            cm = cast("android.hardware.camera2.CameraManager", PythonActivity.mActivity.getSystemService(Context.CAMERA_SERVICE))
+            ids = cm.getCameraIdList()
+            cam_id = ids[0] if isinstance(ids, str) else ids[0]
+            cm.setTorchMode(cam_id, on)
+            return "Torch on." if on else "Torch off."
+        except Exception as e:
+            return "Torch failed: %s" % e
+
+    def act_volume(self, action):
+        if not ANDROID:
+            return "Volume control works only on the phone."
+        try:
+            am = cast("android.media.AudioManager", PythonActivity.mActivity.getSystemService(Context.AUDIO_SERVICE))
+            stream = AudioManager.STREAM_MUSIC
+            flag = AudioManager.FLAG_SHOW_UI
+            if action == "up":
+                am.adjustStreamVolume(stream, AudioManager.ADJUST_RAISE, flag)
+                return "Volume up."
+            if action == "down":
+                am.adjustStreamVolume(stream, AudioManager.ADJUST_LOWER, flag)
+                return "Volume down."
+            if action == "mute":
+                am.adjustStreamVolume(stream, AudioManager.ADJUST_MUTE, flag)
+                return "Muted."
+            if action == "unmute":
+                am.adjustStreamVolume(stream, AudioManager.ADJUST_UNMUTE, flag)
+                return "Unmuted."
+            if action == "max":
+                top = am.getStreamMaxVolume(stream)
+                am.setStreamVolume(stream, top, flag)
+                return "Volume at maximum."
+        except Exception as e:
+            return "Volume failed: %s" % e
+        return "I did not understand that volume command."
+
+    def act_settings(self, page):
+        if not ANDROID:
+            return "Settings works only on the phone."
+        actions = {
+            "wifi": (Settings.ACTION_WIFI_SETTINGS, "Wi-Fi settings."),
+            "bluetooth": (Settings.ACTION_BLUETOOTH_SETTINGS, "Bluetooth settings."),
+            "settings": (Settings.ACTION_SETTINGS, "Settings."),
+        }
+        action, msg = actions[page]
+        try:
+            self.start_activity(Intent(action))
+            return "Opening " + msg
+        except Exception as e:
+            return "Could not open settings: %s" % e
+
+    def act_battery(self):
+        if not ANDROID:
+            return "Battery check works only on the phone."
+        try:
+            act = PythonActivity.mActivity
+            info = act.registerReceiver(None, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            level = info.getIntExtra("level", -1)
+            scale = info.getIntExtra("scale", -1)
+            if level < 0 or scale <= 0:
+                return "I could not read the battery level."
+            pct = round(level * 100.0 / scale)
+            return "Battery is at %d percent." % pct
+        except Exception as e:
+            return "Battery check failed: %s" % e
+
+    def act_sms(self, name, text):
+        if not ANDROID:
+            return "Sending messages works only on the phone."
+        if self.need_contacts() or not check_permission(Permission.SEND_SMS):
+            request_permissions([Permission.READ_CONTACTS, Permission.SEND_SMS])
+            return "I need contacts and SMS permission. Allow it, then say that again."
+        try:
+            number = find_number(name)
+            if not number:
+                return "I could not find %s in your contacts." % name
+            sms = SmsManager.getDefault()
+            sms.sendTextMessage(number, None, text, None, None)
+            return "Message sent to %s." % name
+        except Exception as e:
+            return "Message failed: %s" % e
+
     def act_open(self, name):
         if not ANDROID:
             return "Opening apps works only on the phone."
@@ -1246,7 +1441,8 @@ class Mini(App):
             apps = pm.queryIntentActivities(i, 0)
             for k in range(apps.size()):
                 ri = cast("android.content.pm.ResolveInfo", apps.get(k))
-                label = ri.loadLabel(pm).toString().lower()
+                raw_label = ri.loadLabel(pm)
+                label = (raw_label if isinstance(raw_label, str) else raw_label.toString()).lower()
                 if name in label:
                     self.start_activity(pm.getLaunchIntentForPackage(ri.activityInfo.packageName))
                     return "Opening %s." % label
@@ -1261,13 +1457,28 @@ class Mini(App):
 
     def act_search(self, query):
         if not ANDROID:
-            return "Search works only on the phone."
+            return self.say("Search works only on the phone.")
+        self.set_state("thinking", 30)
+
+        def worker():
+            answer = None
+            try:
+                answer = fetch_instant_answer(query)
+            except Exception:
+                answer = None
+            Clock.schedule_once(lambda dt: self.finish_search(query, answer))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_search(self, query, answer):
+        if answer:
+            return self.say(answer)
         try:
             url = "https://www.google.com/search?q=" + urllib.parse.quote(query)
             self.start_activity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-            return "Searching for %s." % query
+            self.say("I could not find a direct answer, so I opened a search for %s." % query)
         except Exception as e:
-            return "Search failed: %s" % e
+            self.say("Search failed: %s" % e)
 
     # ---------- weather (online) ----------
     def act_weather(self, lang, city):
