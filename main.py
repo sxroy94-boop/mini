@@ -688,6 +688,15 @@ class Orb(Widget):
 
 
 # ================================================================ helpers
+def call_tablet(ip, text, port=5000, timeout=12):
+    """Send one line of text to the mini Brain server running on the tablet."""
+    url = "http://%s:%d/command" % (ip, port)
+    body = json.dumps({"text": text}).encode()
+    req = urllib.request.Request(url, data=body, headers={"content-type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
 def call_gemini(key, model, system, contents):
     url = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent" % model
     body = json.dumps(
@@ -816,6 +825,8 @@ class Mini(App):
         self.model = cfg.get("model", MODEL)
         if self.model.startswith(("gemini-1.5", "gemini-2.0")):
             self.model = MODEL
+        self.tablet_on = bool(cfg.get("tablet_on", False))
+        self.tablet_ip = cfg.get("tablet_ip", "")
 
         self.history = []
         self.lines = []
@@ -866,7 +877,8 @@ class Mini(App):
         self.mode_btn = styled_button("", font_size="13sp", on_release=self.toggle_mode)
         self.listen_btn = styled_button("", font_size="13sp", on_release=self.toggle_listen)
         self.pro_btn = styled_button("", font_size="13sp", on_release=self.toggle_pro)
-        for b in (self.mode_btn, self.listen_btn, self.pro_btn):
+        self.tablet_btn = styled_button("", font_size="13sp", on_release=self.toggle_tablet)
+        for b in (self.mode_btn, self.listen_btn, self.pro_btn, self.tablet_btn):
             row3.add_widget(b)
         root.add_widget(row3)
 
@@ -877,6 +889,15 @@ class Mini(App):
             styled_button("Save key", size_hint_x=None, width=dp(100), on_release=self.save_key)
         )
         root.add_widget(keyrow)
+
+        tabrow = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(6))
+        self.tablet_inp = styled_input("Tablet IP (e.g. 192.168.1.15 or 100.x.x.x)")
+        self.tablet_inp.text = self.tablet_ip
+        tabrow.add_widget(self.tablet_inp)
+        tabrow.add_widget(
+            styled_button("Save IP", size_hint_x=None, width=dp(90), on_release=self.save_tablet_ip)
+        )
+        root.add_widget(tabrow)
 
         self.refresh_buttons()
         return root
@@ -927,6 +948,8 @@ class Mini(App):
                 "mood": self.brain.mood,
                 "model": self.model,
                 "cc": self.cc,
+                "tablet_on": self.tablet_on,
+                "tablet_ip": self.tablet_ip,
             },
         )
 
@@ -934,6 +957,27 @@ class Mini(App):
         self.mode_btn.text = "ONLINE" if self.online else "OFFLINE"
         self.listen_btn.text = "LISTEN: " + ("ON" if self.always else "OFF")
         self.pro_btn.text = "PROACTIVE: " + ("ON" if self.proactive_on else "OFF")
+        self.tablet_btn.text = "TABLET: " + ("ON" if self.tablet_on else "OFF")
+
+    def save_tablet_ip(self, *_):
+        ip = self.tablet_inp.text.strip()
+        self.tablet_ip = ip
+        self.save_settings()
+        self.add("(Tablet IP saved: %s)" % (ip or "none"))
+
+    def toggle_tablet(self, *_):
+        self.wake()
+        if not self.tablet_on and not self.tablet_ip:
+            self.add("Set the tablet IP below first, then tap Save IP.")
+            return
+        self.tablet_on = not self.tablet_on
+        self.save_settings()
+        self.refresh_buttons()
+        self.say(
+            "Tablet mode on. I will send commands to mini Brain."
+            if self.tablet_on
+            else "Tablet mode off. I will process commands myself again."
+        )
 
     def set_mode(self, online):
         self.online = online
@@ -1211,6 +1255,13 @@ class Mini(App):
         if not t:
             return
         self.wake()
+
+        if self.tablet_on:
+            self.add("You: " + t)
+            self.set_state("thinking", 30)
+            threading.Thread(target=self.tablet_worker, args=(t,), daemon=True).start()
+            return
+
         kind, p = self.brain.route(t)
         if kind in ("vault_save", "vault_get"):
             self.add("You: (password command)")
@@ -1261,6 +1312,49 @@ class Mini(App):
                 self.ask_ai(p)
             else:
                 self.say("I am offline. Switch to online mode for chat.")
+
+    # ---------- tablet mode (mini Brain) ----------
+    def tablet_worker(self, text):
+        try:
+            resp = call_tablet(self.tablet_ip, text)
+        except Exception as e:
+            msg = "I cannot reach mini Brain on the tablet: %s" % e
+            Clock.schedule_once(lambda dt: self.say(msg))
+            return
+        Clock.schedule_once(lambda dt: self.dispatch_tablet_action(resp))
+
+    def dispatch_tablet_action(self, resp):
+        action = resp.get("action")
+        spoken = resp.get("spoken", "")
+        shown = resp.get("shown", spoken)
+        if action == "say":
+            self.say(R(spoken, shown))
+        elif action == "stop":
+            self.sleep_now(None)
+            self.say(R(spoken, shown))
+        elif action == "off":
+            self.say(R(spoken, shown))
+            Clock.schedule_once(lambda dt: self.stop(), 2.5)
+        elif action == "call":
+            self.say(self.act_call(resp.get("target", "")))
+        elif action == "open":
+            self.say(self.act_open(resp.get("target", "")))
+        elif action == "whatsapp":
+            self.say(self.act_whatsapp(resp.get("target", "")))
+        elif action == "torch":
+            self.say(self.act_torch(bool(resp.get("on"))))
+        elif action == "volume":
+            self.say(self.act_volume(resp.get("mode", "")))
+        elif action == "settings":
+            self.say(self.act_settings(resp.get("page", "settings")))
+        elif action == "battery":
+            self.say(self.act_battery())
+        elif action == "sms":
+            self.say(self.act_sms(resp.get("target", ""), resp.get("text", "")))
+        elif action == "search":
+            self.finish_search(resp.get("query", ""), None)
+        else:
+            self.say("I got an unexpected reply from mini Brain.")
 
     # ---------- phone actions ----------
     def start_activity(self, intent):
