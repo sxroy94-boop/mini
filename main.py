@@ -141,6 +141,24 @@ def has_deva(text):
     return bool(DEVA.search(text))
 
 
+def extract_action_json(text):
+    """If Gemini replied with a phone-action JSON object (optionally wrapped
+    in ```json fences), return the parsed dict; otherwise return None so the
+    caller falls back to treating it as normal spoken text."""
+    t = text.strip()
+    t = re.sub(r"^```(?:json)?\s*", "", t, flags=re.I)
+    t = re.sub(r"\s*```$", "", t).strip()
+    if not (t.startswith("{") and t.endswith("}")):
+        return None
+    try:
+        data = json.loads(t)
+    except Exception:
+        return None
+    if isinstance(data, dict) and "action" in data:
+        return data
+    return None
+
+
 def segments(text, base):
     """Split text so numbers are always spoken with the English voice."""
     out, pos = [], 0
@@ -363,7 +381,23 @@ class Brain:
             "Reply in the language the user used: English or Hindi. "
             "For an English reply output exactly: EN@@<text> "
             "For a Hindi reply output exactly: HI@@<Hindi in Devanagari script>@@<the same sentence in Roman letters> "
-            "Write numbers as digits. No markdown, no emojis. Never use Bengali."
+            "Write numbers as digits. No markdown, no emojis. Never use Bengali. "
+            "If, and only if, the user is asking you to DO something on the phone (open an app, "
+            "search, call, message, control volume/torch/settings, check battery, or get directions), "
+            "reply with ONLY a raw JSON object and nothing else - no EN@@/HI@@ prefix, no markdown fences, "
+            "no extra words. Choose the closest one of these shapes:\n"
+            '{"action":"open","app":"<app name>"}\n'
+            '{"action":"open_and_search","app":"<youtube|spotify|other app name>","query":"<search text>"}\n'
+            '{"action":"search","query":"<text>"}\n'
+            '{"action":"call","name":"<contact name>"}\n'
+            '{"action":"whatsapp","name":"<contact name>"}\n'
+            '{"action":"sms","name":"<contact name>","text":"<message>"}\n'
+            '{"action":"volume","mode":"up|down|mute|unmute|max"}\n'
+            '{"action":"torch","on":true|false}\n'
+            '{"action":"settings","page":"wifi|bluetooth|settings"}\n'
+            '{"action":"battery"}\n'
+            '{"action":"navigate","place":"<place name>"}\n'
+            "For anything else (questions, chat, greetings) reply normally in the EN@@/HI@@ format."
         ) % self.nick
         if self.mood == "personal":
             base += " Use a soft, caring, but respectful and non-romantic tone, and sometimes ask how the user is."
@@ -1628,12 +1662,86 @@ class Mini(App):
         if not reply:
             return self.say("I have no answer for that.")
         self.history.append({"role": "model", "parts": [{"text": reply}]})
+        action = extract_action_json(reply)
+        if action:
+            return self.run_ai_action(action)
         self.say(self.brain.parse_ai(reply))
 
     def on_ai_fail(self, msg):
         if self.history and self.history[-1]["role"] == "user":
             self.history.pop()
         self.say(msg)
+
+    # ---------- smart online-mode actions (Gemini decided the intent) ----------
+    def run_ai_action(self, data):
+        act = data.get("action")
+        if act == "open":
+            return self.say(self.act_open((data.get("app") or "").lower().strip()))
+        if act == "open_and_search":
+            return self.say(self.act_open_and_search(data.get("app", ""), data.get("query", "")))
+        if act == "search":
+            return self.act_search(data.get("query", ""))  # async, speaks its own result
+        if act == "call":
+            return self.say(self.act_call(data.get("name", "")))
+        if act == "whatsapp":
+            return self.say(self.act_whatsapp(data.get("name", "")))
+        if act == "sms":
+            return self.say(self.act_sms(data.get("name", ""), data.get("text", "")))
+        if act == "volume":
+            return self.say(self.act_volume(data.get("mode", "")))
+        if act == "torch":
+            return self.say(self.act_torch(bool(data.get("on"))))
+        if act == "settings":
+            return self.say(self.act_settings(data.get("page", "settings")))
+        if act == "battery":
+            return self.say(self.act_battery())
+        if act == "navigate":
+            return self.say(self.act_navigate(data.get("place", "")))
+        self.say("I understood that as an action, but I do not know how to do it yet.")
+
+    def act_open_and_search(self, app, query):
+        if not ANDROID:
+            return "This works only on the phone."
+        app_l = (app or "").lower().strip()
+        q = query or ""
+        try:
+            if "youtube" in app_l:
+                try:
+                    i = Intent(Intent.ACTION_SEARCH)
+                    i.setPackage("com.google.android.youtube")
+                    i.putExtra("query", q)
+                    self.start_activity(i)
+                except Exception:
+                    url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote(q)
+                    self.start_activity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                return "Searching %s on YouTube." % q
+            if "spotify" in app_l:
+                uri = "spotify:search:" + urllib.parse.quote(q)
+                self.start_activity(Intent(Intent.ACTION_VIEW, Uri.parse(uri)))
+                return "Searching %s on Spotify." % q
+            opened = self.act_open(app_l)
+            if q:
+                opened += " I could not search inside it directly, so just opened the app."
+            return opened
+        except Exception as e:
+            return "Could not open and search: %s" % e
+
+    def act_navigate(self, place):
+        if not ANDROID:
+            return "Navigation works only on the phone."
+        if not place:
+            return "Where do you want to go?"
+        try:
+            uri = "geo:0,0?q=" + urllib.parse.quote(place)
+            i = Intent(Intent.ACTION_VIEW, Uri.parse(uri))
+            try:
+                i.setPackage("com.google.android.apps.maps")
+                self.start_activity(i)
+            except Exception:
+                self.start_activity(Intent(Intent.ACTION_VIEW, Uri.parse(uri)))
+            return "Navigating to %s." % place
+        except Exception as e:
+            return "Navigate failed: %s" % e
 
 
 if __name__ == "__main__":
