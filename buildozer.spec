@@ -17,7 +17,7 @@ android.archs = arm64-v8a
 android.accept_sdk_license = True
 android.allow_backup = True
 android.extra_manifest_xml = ./extra_manifest.xml
-
+android.add_src = java_src
 # Pin p4a to a stable release
 p4a.branch = v2024.01.21
 
