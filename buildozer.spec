@@ -3,7 +3,7 @@ title = mini
 package.name = mini
 package.domain = org.mini
 source.dir = .
-source.include_exts = py,png,jpg,kv,atlas,json
+source.include_exts = py,png,jpg,kv,atlas,json,java
 version = 1.0
 requirements = python3,kivy==2.3.0,pyjnius,android,certifi
 orientation = portrait
