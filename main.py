@@ -952,16 +952,9 @@ class Mini(App):
             )
             self.init_tts()
             self.rec_listener = RecListener(self.sr_text_cb, self.sr_err_cb)
-            self.start_call_watcher()
-            # --- Java bridge test ---
-if ANDROID:
-    try:
-        MiniBridge = autoclass("org.mini.MiniBridge")
-        self.add("(Java: " + MiniBridge.hello() + ")")
-    except Exception as e:
-        self.add("(Java FAIL: " + str(e) + ")")
-        self.say(self.brain.greeting())
-        Clock.schedule_interval(self.housekeeping, 15)
+            self.start_call_watcher()   
+self.say(self.brain.greeting())
+Clock.schedule_interval(self.housekeeping, 15)
 
     def on_pause(self):
         return True
