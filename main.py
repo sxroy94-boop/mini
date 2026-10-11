@@ -937,24 +937,7 @@ class Mini(App):
         return root
 
     # ---------- lifecycle ----------
-  def start_brain_service(self):
-    try:
-        from jnius import autoclass
-        Intent = autoclass("android.content.Intent")
-        PythonActivity = autoclass("org.kivy.android.PythonActivity")
-        MiniBrainService = autoclass("org.mini.MiniBrainService")
-        activity = PythonActivity.mActivity
-        intent = Intent(activity, MiniBrainService)
-        if hasattr(activity, "startForegroundService"):
-            activity.startForegroundService(intent)
-        else:
-            activity.startService(intent)
-        print("mini Brain Service started")
-    except Exception as e:
-        print("Service start failed: " + str(e))
-      
     def on_start(self):
-        self.start_brain_service()
         if ANDROID:
             android_activity.bind(on_activity_result=self.on_activity_result)
             request_permissions(
